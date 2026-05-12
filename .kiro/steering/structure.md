@@ -1,24 +1,25 @@
 # Project Structure
 
-> This project is greenfield. The structure below is the target layout for a microservices-based dispatch platform. Update as services are scaffolded.
+> This project is greenfield. The structure below is the target layout for a microservices-based dispatch platform using DDD-influenced bounded contexts (see ADR 001). Update as services are scaffolded.
 
 ## Top-Level Layout
 
 ```
 realtime-tracking-dispatch/
-├── services/                  # Individual microservices
-│   ├── ingest/                # GPS ping ingestion service
-│   ├── dispatch/              # Driver-to-order matching engine
-│   ├── tracking/              # ETA computation and location state
-│   ├── notification/          # Push notification delivery
-│   └── gateway/               # API gateway / WebSocket hub for clients
-├── shared/                    # Shared libraries/packages (DTOs, utils, errors)
+├── services/                  # Individual microservices (one per bounded context)
+│   ├── ingest/                # Location BC — GPS ping ingestion
+│   ├── dispatch/              # Dispatch BC — Trip aggregate, driver matching
+│   ├── tracking/              # Location BC — ETA computation, geospatial state
+│   ├── notification/          # Notification BC — push notification delivery
+│   └── gateway/               # Client Gateway BC — auth, WebSocket/SSE hub
+├── shared/                    # Infrastructure concerns ONLY (see Conventions)
 ├── infra/                     # Infrastructure-as-code
 │   ├── docker/                # Dockerfiles per service
 │   ├── k8s/                   # Kubernetes manifests
 │   └── kafka/                 # Topic configs, schema registry
 ├── scripts/                   # Dev/ops helper scripts
 ├── docs/                      # Architecture diagrams, ADRs
+│   └── adr/                   # Architecture Decision Records (NNN-title.md)
 ├── .kiro/                     # Kiro specs and steering
 │   ├── specs/                 # Feature specs (requirements, design, tasks)
 │   └── steering/              # AI steering rules (this folder)
@@ -27,21 +28,38 @@ realtime-tracking-dispatch/
 └── README.md
 ```
 
-## Service Responsibilities
+## Bounded Contexts → Services
 
-| Service        | Responsibility |
-|----------------|----------------|
-| `ingest`       | Receives GPS pings via HTTP/gRPC, publishes to Kafka `gps-pings` topic |
-| `dispatch`     | Consumes order events, queries Redis for nearby drivers, assigns matches |
-| `tracking`     | Consumes GPS pings, updates Redis geospatial index, computes and streams ETAs |
-| `notification` | Consumes state-change events, sends FCM push notifications |
-| `gateway`      | Authenticates clients, proxies REST calls, manages WebSocket/SSE connections |
+| Bounded Context | Service(s) | Core Aggregate | Owns |
+|---|---|---|---|
+| **Location** | `ingest`, `tracking` | `DriverLocation` | GPS pings, geospatial state, ETA computation |
+| **Dispatch** | `dispatch` | `Trip` | Trip lifecycle, driver assignment, matching logic |
+| **Notification** | `notification` | `Notification` | Delivery state, provider abstraction |
+| **Client Gateway** | `gateway` | — | Auth, WebSocket/SSE fan-out, API proxying |
+
+## Domain Events (Kafka Integration Contract)
+
+Services integrate via typed Domain Events. Event names use past-tense domain language:
+
+| Event | Producer | Consumer(s) | Topic | Consumer Purpose |
+|---|---|---|---|---|
+| `LocationPingReceived` | `ingest` | `tracking` (authoritative), `dispatch` (read model) | `gps-pings` | Tracking: geospatial state + ETAs; Dispatch: local matching index |
+| `TripRequested` | `dispatch` | `dispatch` (self, async) | `ride-events` | Dispatch: trigger matching |
+| `TripAssigned` | `dispatch` | `notification` | `ride-events` | Notification: log/send notification |
+| `TripCompleted` | `dispatch` | `notification` | `ride-events` | Notification: log/send notification |
+| `NotificationDispatched` | `notification` | — | `notifications` | — |
+
+All Kafka messages include an `event_type` field in the payload to distinguish domain events on the same topic.
 
 ## Conventions
 
 - Each service is independently deployable with its own `Dockerfile` and config
-- Shared types/DTOs live in `shared/` — never duplicate across services
-- All inter-service communication goes through Kafka topics (async) or gRPC (sync queries only)
+- Each bounded context defines its own internal domain model — domain objects are **never** placed in `shared/`
+- `shared/` is restricted to infrastructure concerns: Kafka envelope schema, health check DTOs, common error shapes, proto/Avro definitions
+- It is acceptable (and expected) for multiple bounded contexts to have their own representation of concepts like `trip_id` — this is intentional decoupling, not duplication
+- All inter-service communication goes through Kafka Domain Events (async) — there are NO synchronous cross-context queries in the hot path
+- The Dispatch service maintains a local CQRS read model of driver locations by consuming `LocationPingReceived` events — it never calls the Location/Tracking service synchronously (see ADR 005)
+- Synchronous HTTP/gRPC between services is only permitted for non-hot-path operations (e.g., admin queries, health checks)
 - Environment-specific config via environment variables — no hardcoded secrets or URLs
 - Each service owns its own database schema; no cross-service direct DB access
-- ADRs (Architecture Decision Records) go in `docs/adr/` with format `NNN-title.md`
+- ADRs go in `docs/adr/` with format `NNN-title.md`

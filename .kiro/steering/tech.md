@@ -52,5 +52,21 @@
 
 - All GPS ping ingestion must go through Kafka — never write directly to DB from the ingest endpoint
 - Driver location state lives in Redis; PostgreSQL is the source of truth for order/ride records
-- Services communicate asynchronously via Kafka events; synchronous REST/gRPC only for query paths
+- Services communicate asynchronously via Kafka Domain Events; synchronous REST/gRPC only for cross-context query paths
 - Push notifications must be fire-and-forget with retry logic — never block the dispatch critical path
+- Each service is a Bounded Context — domain objects (Trip, DriverLocation, Notification) are never shared via a common library; only infrastructure types live in `shared/`
+- Kafka messages must include an `event_type` field to distinguish Domain Events on the same topic (e.g., `TripRequested`, `TripAssigned` on `ride-events`)
+- The `Trip` aggregate is owned exclusively by the Dispatch service — no other service reads or writes the Trip table directly
+- Cross-context queries (e.g., Dispatch querying DriverLocation) go through an internal HTTP/gRPC API, never direct DB or Redis access from another service — **exception**: Dispatch uses a CQRS local read model instead of synchronous queries (see ADR 005)
+- See `docs/adr/001-microservices-with-ddd-bounded-contexts.md` for the full decision record
+
+## Security Constraints
+
+- No secrets, passwords, or API keys in source control — ever. Use `.env` (gitignored) loaded from `.env.example`
+- All service configuration (broker addresses, credentials, ports) via environment variables — no hardcoded defaults
+- Each service has its own Kafka SASL credentials with ACLs restricted to only the topics it owns (principle of least privilege)
+- Docker Compose named networks segment traffic: services only join networks they require (`kafka-net`, `db-net`, `frontend-net`)
+- All Dockerfiles run as non-root users and use pinned base image versions — never `latest`
+- All HTTP endpoints enforce a 64 KB maximum request body size
+- Services must fail fast with a descriptive error if a required environment variable is missing — never start with insecure defaults
+- See `docs/adr/004-security-model.md` for the full security model, threat model, and Phase 2 controls (JWT auth, TLS, rate limiting)
