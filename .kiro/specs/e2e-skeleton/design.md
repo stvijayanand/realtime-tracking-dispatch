@@ -347,6 +347,466 @@ python simulate_driver.py \
 
 ---
 
+## Low-Level Design
+
+This section specifies the internal module structure, design patterns, and key function/method signatures for each service. It bridges the component interfaces defined above and the implementation tasks that follow.
+
+---
+
+### 1. Ingest Service (`services/ingest/`)
+
+#### Module Structure
+
+```
+services/ingest/
+  main.py                          — FastAPI app factory, lifespan context manager, route registration
+  config.py                        — Settings class (pydantic-settings), fail-fast env var loading
+  models.py                        — Pydantic request/response models (GpsPingRequest, LocationAcceptedResponse)
+  kafka_producer.py                — KafkaProducerClient class (singleton via module-level instance)
+  events.py                        — DomainEvent dataclass, build_location_ping_event() factory function
+  routers/
+    location.py                    — POST /location route handler
+    health.py                      — GET /health route handler
+  tests/
+    test_location_endpoint.py      — unit + property tests (Hypothesis)
+    test_kafka_producer.py         — unit tests with mocked confluent-kafka
+```
+
+#### Design Patterns Applied
+
+- **Dependency Injection**: `KafkaProducerClient` is injected into route handlers via FastAPI `Depends()`. It is never instantiated inside the handler body — the handler declares it as a parameter and FastAPI resolves it from the module-level singleton.
+- **Factory Function**: `build_location_ping_event(ping: GpsPingRequest) -> DomainEvent` constructs the full event envelope. UUID generation (`event_id`) and timestamp generation (`occurred_at`) are isolated inside this function, making it a pure, deterministic-input function that is straightforward to test with Hypothesis.
+- **Settings Object (12-Factor)**: `pydantic-settings` `Settings` class reads all required environment variables at import time. If any required variable is absent, `ValidationError` is raised before the ASGI app starts — the service never starts with a missing configuration.
+- **Middleware for body size**: `MaxBodySizeMiddleware` is a Starlette `BaseHTTPMiddleware` subclass applied at the app level in `main.py`. The 64 KB limit is enforced before the request body reaches any route handler — it is not checked inline in the handler.
+- **Result type for Kafka publish**: `KafkaProducerClient.publish()` raises `KafkaPublishError` on failure rather than returning a sentinel value. The route handler catches `KafkaPublishError` and converts it to HTTP 503. This keeps the happy path clean and avoids silent error swallowing.
+
+#### Key Function Signatures
+
+```python
+# config.py
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    kafka_bootstrap_servers: str
+    kafka_topic_gps_pings: str
+    kafka_sasl_username: str
+    kafka_sasl_password: str
+    service_port: int = 8001
+
+    class Config:
+        env_file = ".env"
+
+# events.py
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class DomainEvent:
+    event_id: str        # UUID4, generated at publish time
+    event_type: str
+    occurred_at: str     # ISO 8601
+    payload: dict
+
+def build_location_ping_event(ping: GpsPingRequest) -> DomainEvent:
+    """
+    Pure factory: generates event_id (UUID4) and occurred_at (utcnow ISO 8601),
+    copies driver_id, latitude, longitude, timestamp from ping into payload.
+    Never raises — all inputs are pre-validated by Pydantic.
+    """
+
+# kafka_producer.py
+class KafkaProducerClient:
+    def __init__(self, settings: Settings) -> None:
+        """Initialises confluent-kafka Producer with SASL/PLAIN and enable.idempotence=true."""
+
+    def publish(self, topic: str, key: str, event: DomainEvent) -> str:
+        """
+        Serialises event to JSON, calls producer.produce(), flushes.
+        Returns event_id on success.
+        Raises KafkaPublishError on delivery failure.
+        """
+
+# routers/location.py
+from fastapi import Depends
+
+async def ingest_location(
+    ping: GpsPingRequest,
+    producer: KafkaProducerClient = Depends(get_producer),
+) -> LocationAcceptedResponse:
+    """
+    Builds DomainEvent via build_location_ping_event(ping).
+    Calls producer.publish(topic, key=ping.driver_id, event).
+    Returns 202 LocationAcceptedResponse(message_id=event.event_id).
+    Raises HTTPException(503) on KafkaPublishError.
+    """
+```
+
+#### Sequence: POST /location (happy path)
+
+```
+Client → POST /location (JSON body)
+  → MaxBodySizeMiddleware: body ≤ 64 KB? → pass
+  → Pydantic GpsPingRequest validation → 422 if invalid
+  → ingest_location() handler
+      → build_location_ping_event(ping) → DomainEvent
+      → producer.publish(topic, key=driver_id, event)
+          → confluent-kafka produce + flush
+      → return 202 { "message_id": event.event_id }
+```
+
+---
+
+### 2. Dispatch Service (`services/dispatch/`)
+
+#### Package Structure
+
+```
+com.dispatch/
+  DispatchApplication.java                  — @SpringBootApplication, startup validation
+  config/
+    AppConfig.java                          — @Configuration, KafkaTemplate bean, env var validation
+    KafkaConsumerConfig.java                — Consumer factory beans for ride-events and gps-pings
+  domain/
+    Trip.java                               — @Entity, fields: tripId, riderId, driverId, status,
+                                              pickupLat, pickupLng, requestedAt, assignedAt, updatedAt
+    TripStatus.java                         — enum: REQUESTED, ASSIGNED, CANCELLED;
+                                              assertCanTransitionTo() guard method
+    TripRepository.java                     — JpaRepository<Trip, UUID>
+  events/
+    DomainEventEnvelope.java                — record: eventId, eventType, occurredAt, payload (Map<String,Object>)
+    TripRequestedPayload.java               — record: tripId, riderId, pickupLocation, requestedAt
+    TripAssignedPayload.java                — record: tripId, driverId, riderId, assignedAt
+    TripCancelledPayload.java               — record: tripId, reason, cancelledAt (Phase 1: modelled only)
+    EventEnvelopeFactory.java               — static factory: buildTripRequested(), buildTripAssigned()
+  service/
+    DispatchService.java                    — @Service, orchestrates: persist → publish → return tripId
+    DriverRegistry.java                     — @Component, static in-memory driver list, selectDriver()
+    DriverSelectionStrategy.java            — interface: selectDriver(PickupLocation) -> String
+    HardcodedDriverSelectionStrategy.java   — implements DriverSelectionStrategy, round-robin from list
+  consumer/
+    RideEventsConsumer.java                 — @KafkaListener, ride-events topic, dispatch-consumer-group
+    LocationPingConsumer.java               — @KafkaListener, gps-pings topic, dispatch-location-group
+    EnvelopeValidator.java                  — stateless validator: validate(DomainEventEnvelope) -> void
+  web/
+    RideController.java                     — @RestController, POST /request-ride
+    HealthController.java                   — GET /health
+    dto/
+      RequestRideRequest.java               — record with @Valid annotations
+      RequestRideResponse.java              — record: tripId (UUID)
+      PickupLocation.java                   — record: latitude (double), longitude (double)
+```
+
+#### Design Patterns Applied
+
+- **State Machine with guard**: `TripStatus.assertCanTransitionTo(TripStatus next)` throws `IllegalStateTransitionException` if the requested transition is not valid for the current state. The guard is enforced in the domain enum — not scattered across service methods — so invalid transitions are impossible to reach without an explicit exception.
+- **Factory pattern for events**: `EventEnvelopeFactory` is a stateless utility class with static factory methods. All UUID generation (`eventId`) and timestamp generation (`occurredAt`) are isolated here. `DispatchService` never calls `UUID.randomUUID()` directly.
+- **Strategy pattern (stub)**: `DriverSelectionStrategy` interface is defined in Phase 1 with `HardcodedDriverSelectionStrategy` as the sole implementation. `DispatchService` depends on the interface, not the concrete class. Phase 2 can inject a geospatial Redis-backed strategy without modifying `DispatchService`.
+- **Template Method via Spring Kafka**: `@KafkaListener` methods in `RideEventsConsumer` and `LocationPingConsumer` delegate immediately to private handler methods. Envelope validation is extracted to `EnvelopeValidator.validate(DomainEventEnvelope)` — a separate, independently testable component.
+- **Fail-fast configuration**: `AppConfig` has a `@PostConstruct` method `validateRequiredEnvVars()` that iterates a list of required environment variable names and throws `IllegalStateException` (with the missing variable name) if any are absent. This runs before the application context finishes starting.
+
+#### Key Method Signatures
+
+```java
+// domain/TripStatus.java
+public enum TripStatus {
+    REQUESTED, ASSIGNED, CANCELLED;
+
+    private static final Map<TripStatus, Set<TripStatus>> VALID_TRANSITIONS = Map.of(
+        REQUESTED, Set.of(ASSIGNED, CANCELLED),
+        ASSIGNED,  Set.of(CANCELLED),
+        CANCELLED, Set.of()
+    );
+
+    public void assertCanTransitionTo(TripStatus next) {
+        if (!VALID_TRANSITIONS.get(this).contains(next)) {
+            throw new IllegalStateTransitionException(this, next);
+        }
+    }
+}
+
+// service/DriverSelectionStrategy.java
+public interface DriverSelectionStrategy {
+    String selectDriver(PickupLocation pickup);
+}
+
+// service/HardcodedDriverSelectionStrategy.java
+@Component
+public class HardcodedDriverSelectionStrategy implements DriverSelectionStrategy {
+    private static final List<String> DRIVERS = List.of("driver-001", "driver-002", "driver-003");
+    private final AtomicInteger counter = new AtomicInteger(0);
+
+    @Override
+    public String selectDriver(PickupLocation pickup) {
+        // Round-robin selection from static list; ignores pickup in Phase 1
+        return DRIVERS.get(counter.getAndIncrement() % DRIVERS.size());
+    }
+}
+
+// service/DispatchService.java
+@Service
+public class DispatchService {
+    @Transactional
+    public UUID requestRide(String riderId, PickupLocation pickup) {
+        // 1. Generate tripId (UUID)
+        // 2. Persist Trip(status=REQUESTED) to PostgreSQL
+        // 3. Build TripRequested envelope via EventEnvelopeFactory
+        // 4. Publish to ride-events topic
+        // 5. Return tripId
+    }
+
+    @Transactional
+    public void assignDriver(UUID tripId, String riderId) {
+        // 1. Load Trip from DB; assert status.assertCanTransitionTo(ASSIGNED)
+        // 2. Select driver via DriverSelectionStrategy
+        // 3. Update Trip(status=ASSIGNED, driverId, assignedAt)
+        // 4. Build TripAssigned envelope via EventEnvelopeFactory
+        // 5. Publish to ride-events topic
+    }
+}
+
+// consumer/RideEventsConsumer.java
+@KafkaListener(
+    topics = "${kafka.topic.ride-events}",
+    groupId = "${kafka.consumer.group.ride-events}"
+)
+public void onMessage(ConsumerRecord<String, String> record) {
+    // Deserialise → DomainEventEnvelope
+    // Filter: event_type == "TripRequested" only
+    // Delegate to dispatchService.assignDriver(tripId, riderId)
+}
+
+// consumer/EnvelopeValidator.java
+public class EnvelopeValidator {
+    /**
+     * Validates that eventId is a non-empty UUID string and eventType is non-null/non-empty.
+     * Throws EnvelopeValidationException with a descriptive message on failure.
+     */
+    public static void validate(DomainEventEnvelope envelope) { ... }
+}
+
+// events/EventEnvelopeFactory.java
+public class EventEnvelopeFactory {
+    public static DomainEventEnvelope buildTripRequested(
+        UUID tripId, String riderId, PickupLocation pickup, Instant requestedAt) { ... }
+
+    public static DomainEventEnvelope buildTripAssigned(
+        UUID tripId, String driverId, String riderId, Instant assignedAt) { ... }
+}
+```
+
+#### Sequence: POST /request-ride (happy path)
+
+```
+Client → POST /request-ride (JSON body)
+  → Spring body size filter: body ≤ 64 KB? → pass
+  → @Valid RequestRideRequest validation → 422 if invalid
+  → RideController.requestRide()
+      → dispatchService.requestRide(riderId, pickup)
+          → persist Trip(status=REQUESTED) to PostgreSQL
+          → EventEnvelopeFactory.buildTripRequested(...)
+          → kafkaTemplate.send(ride-events, tripId, envelope)
+          → return tripId
+      → return 202 { "trip_id": tripId }
+
+[async — RideEventsConsumer]
+  → onMessage(ConsumerRecord) for TripRequested
+      → dispatchService.assignDriver(tripId, riderId)
+          → load Trip; assertCanTransitionTo(ASSIGNED)
+          → driverSelectionStrategy.selectDriver(pickup) → driverId
+          → update Trip(status=ASSIGNED, driverId, assignedAt)
+          → EventEnvelopeFactory.buildTripAssigned(...)
+          → kafkaTemplate.send(ride-events, tripId, envelope)
+```
+
+---
+
+### 3. Notification Service (`services/notification/`)
+
+#### Module Structure
+
+```
+services/notification/
+  main.py                              — FastAPI app factory, lifespan starts KafkaConsumerWorker thread
+  config.py                            — Settings class (pydantic-settings)
+  consumer.py                          — KafkaConsumerWorker class, runs in background thread
+  handlers.py                          — handle_trip_assigned(event, logger) -> None
+  events.py                            — TripAssignedEvent dataclass, parse_trip_assigned() factory
+  logger.py                            — get_structured_logger() returns JSON-to-stdout logger
+  routers/
+    health.py                          — GET /health
+  tests/
+    test_notification_consumer.py      — unit + property tests (Hypothesis)
+```
+
+#### Design Patterns Applied
+
+- **Observer / Handler dispatch**: `KafkaConsumerWorker` maintains a `dict[str, Callable]` registry mapping `event_type` strings to handler callables. The consumer loop calls `handlers.get(event_type, skip_handler)(event)`. Adding a new event type handler requires no changes to the consumer loop — only a new entry in the registry.
+- **Structured logging via adapter**: `NotificationLogger` wraps stdlib `logging` and always emits JSON to stdout. Handlers call `logger.log_notification(event)` — never `print()` or raw `logging.info()`. This ensures every log line is machine-parseable and consistently structured.
+- **Null Object for skipped events**: When `event_type != "TripAssigned"`, the consumer dispatches to `SkipHandler` — a no-op callable — rather than an inline `if/else`. This keeps the dispatch loop uniform and avoids branching logic in the consumer.
+- **Frozen dataclass for parsed events**: `TripAssignedEvent` is a `@dataclass(frozen=True)`. `parse_trip_assigned(envelope: dict) -> TripAssignedEvent` validates all required fields and raises `EventParseError` if any are missing. The handler never receives a partially-constructed event.
+
+#### Key Function Signatures
+
+```python
+# events.py
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class TripAssignedEvent:
+    event_id: str
+    event_type: str
+    trip_id: str
+    driver_id: str
+    rider_id: str
+    assigned_at: str
+
+def parse_trip_assigned(envelope: dict) -> TripAssignedEvent:
+    """
+    Extracts and validates required fields from the envelope dict.
+    Raises EventParseError (with field name) if any required field is absent or empty.
+    Never returns a partially-constructed TripAssignedEvent.
+    """
+
+# handlers.py
+from notification.logger import NotificationLogger
+
+def handle_trip_assigned(event: TripAssignedEvent, logger: NotificationLogger) -> None:
+    """
+    Writes one structured JSON line to stdout via logger.log_notification(event).
+    The JSON line includes: event_id, event_type, trip_id, driver_id, rider_id,
+    assigned_at, notification_sent_at (utcnow ISO 8601).
+    """
+
+def skip_handler(event: object) -> None:
+    """No-op. Called for all event_type values other than 'TripAssigned'."""
+
+# consumer.py
+class KafkaConsumerWorker:
+    def __init__(
+        self,
+        settings: Settings,
+        handlers: dict[str, Callable],   # e.g. {"TripAssigned": handle_trip_assigned}
+    ) -> None: ...
+
+    def start(self) -> None:
+        """Starts the consumer loop in a daemon background thread."""
+
+    def stop(self) -> None:
+        """Sets the stop flag; waits for the background thread to finish (graceful shutdown)."""
+
+    def _run(self) -> None:
+        """
+        Consumer loop:
+          poll() → deserialise JSON → extract event_type
+          → handlers.get(event_type, skip_handler)(parsed_event)
+          → commit offset
+          On JSON deserialisation failure: log WARNING with raw bytes, commit offset, continue.
+        """
+
+# logger.py
+import logging
+import json
+
+class NotificationLogger:
+    def __init__(self) -> None:
+        self._logger = logging.getLogger("notification")
+        # Configured for JSON output to stdout in get_structured_logger()
+
+    def log_notification(self, event: TripAssignedEvent) -> None:
+        """Emits one JSON log line to stdout with all required fields + notification_sent_at."""
+
+    def log_warning(self, message: str, **context) -> None:
+        """Emits a JSON warning line to stderr."""
+
+def get_structured_logger() -> NotificationLogger:
+    """Configures stdlib logging for JSON stdout output and returns a NotificationLogger."""
+```
+
+#### Sequence: TripAssigned consumed (happy path)
+
+```
+Kafka ride-events topic → KafkaConsumerWorker._run()
+  → consumer.poll()
+  → JSON deserialise → envelope dict
+  → extract event_type = "TripAssigned"
+  → handlers["TripAssigned"](envelope)
+      → parse_trip_assigned(envelope) → TripAssignedEvent
+      → handle_trip_assigned(event, logger)
+          → logger.log_notification(event)
+              → stdout: { "event_id": ..., "trip_id": ..., ..., "notification_sent_at": ... }
+  → consumer.commit()
+```
+
+---
+
+### 4. Shared Module Conventions (`shared/`)
+
+The `shared/` directory contains only infrastructure concerns — never domain objects. Domain types (`Trip`, `DriverLocation`, `Notification`) are defined within their respective bounded contexts.
+
+#### Python (`shared/envelope.py`)
+
+```python
+# shared/envelope.py
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class DomainEventEnvelope:
+    event_id: str
+    event_type: str
+    occurred_at: str     # ISO 8601
+    payload: dict
+
+def validate_envelope(raw: dict) -> DomainEventEnvelope:
+    """
+    Validates that event_id is a non-empty string, event_type is a non-empty string,
+    occurred_at is present, and payload is a dict.
+    Raises EnvelopeValidationError with a descriptive message identifying the failing field.
+    Does NOT validate payload contents — that is the responsibility of each service's
+    event-specific parser (e.g., parse_trip_assigned).
+    """
+```
+
+#### Java (`shared/KafkaEnvelope.java`)
+
+```java
+// shared/KafkaEnvelope.java
+public record KafkaEnvelope(
+    String eventId,
+    String eventType,
+    String occurredAt,
+    Map<String, Object> payload
+) {
+    /**
+     * Convenience factory. Generates eventId (UUID4) and occurredAt (Instant.now() ISO 8601).
+     * Services should prefer EventEnvelopeFactory (service-specific) over this method
+     * for domain event construction — this factory is for infrastructure-level use only.
+     */
+    public static KafkaEnvelope of(String eventType, Map<String, Object> payload) { ... }
+}
+```
+
+**Constraint**: The `shared/` module MUST NOT contain `Trip`, `DriverLocation`, `Notification`, or any other domain aggregate or value object. If a type is needed in more than one service, each service defines its own representation. Shared types are limited to: envelope schema, health check DTOs, common error shapes, and proto/Avro definitions.
+
+---
+
+### 5. Cross-Cutting Patterns Summary
+
+| Pattern | Service(s) | Implementation |
+|---|---|---|
+| Dependency Injection | Ingest, Notification | FastAPI `Depends(get_producer)` for `KafkaProducerClient`; constructor injection of `handlers` dict in `KafkaConsumerWorker` |
+| Factory Function / Method | All | `build_location_ping_event()` (Ingest), `EventEnvelopeFactory.buildTripRequested/Assigned()` (Dispatch), `parse_trip_assigned()` (Notification) |
+| Settings Object (12-Factor) | Ingest, Notification | `pydantic-settings` `Settings` class; `ValidationError` raised at import time on missing vars |
+| State Machine with guard | Dispatch | `TripStatus.assertCanTransitionTo()` — invalid transitions throw `IllegalStateTransitionException` |
+| Strategy (stub) | Dispatch | `DriverSelectionStrategy` interface + `HardcodedDriverSelectionStrategy`; `DispatchService` depends on the interface |
+| Observer / Handler dispatch | Notification | `KafkaConsumerWorker` handler registry `dict[str, Callable]` keyed by `event_type` |
+| Null Object | Notification | `skip_handler` no-op callable for non-`TripAssigned` event types |
+| Structured logging adapter | Notification | `NotificationLogger` wrapping stdlib JSON logger; all log output goes through `log_notification()` / `log_warning()` |
+| Middleware (body size) | Ingest | `MaxBodySizeMiddleware(max_bytes=65536)` applied at app level in `main.py` |
+| Fail-fast `@PostConstruct` | Dispatch | `AppConfig.validateRequiredEnvVars()` — throws `IllegalStateException` with missing var name before context finishes loading |
+| Envelope validation | Dispatch, Notification | `EnvelopeValidator.validate()` (Java), `validate_envelope()` (Python) — stateless, independently testable |
+| Idempotent Kafka producer | Ingest, Dispatch | `enable.idempotence=true` on all producers; prevents duplicate delivery within a producer session |
+
+---
+
 ## Data Models
 
 ### PostgreSQL Schema (Dispatch Service)

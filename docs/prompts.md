@@ -99,6 +99,9 @@ In ADR 006, you said '| Notification delivery fails | `NotificationFailed` | Log
 
 How does the rider know if notification fails that a driver has been assigned?
 
+## Design Patterns
+
+I'd like you to implement best practices including Low level design patterns.
 
 
 
