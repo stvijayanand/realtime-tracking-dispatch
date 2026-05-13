@@ -83,6 +83,22 @@ Querying data across multiple contexts synchronously can create cascading failur
 
 Are you going to use CQRS and external foreign data replication?
 
+## Transaction boundaries
+
+Are you using the Saga Pattern (Orchestration or Choreography) to manage distributed transactions and execute compensating actions upon failures?
+
+### Clarification on Saga steps
+
+You said 'The saga is short (3 steps) and linear — choreography handles it cleanly.'
+
+Is this short for the whole system or for just phase 1? 
+
+#### More clarification on notification
+
+In ADR 006, you said '| Notification delivery fails | `NotificationFailed` | Log to DLQ; do not block trip progression |'
+
+How does the rider know if notification fails that a driver has been assigned?
+
 
 
 

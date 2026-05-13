@@ -34,8 +34,8 @@ realtime-tracking-dispatch/
 |---|---|---|---|
 | **Location** | `ingest`, `tracking` | `DriverLocation` | GPS pings, geospatial state, ETA computation |
 | **Dispatch** | `dispatch` | `Trip` | Trip lifecycle, driver assignment, matching logic |
-| **Notification** | `notification` | `Notification` | Delivery state, provider abstraction |
-| **Client Gateway** | `gateway` | — | Auth, WebSocket/SSE fan-out, API proxying |
+| **Notification** | `notification` | `Notification` | Push notification delivery (FCM/APNs), best-effort secondary channel |
+| **Client Gateway** | `gateway` | — | Auth, WebSocket/SSE fan-out (primary real-time channel to riders), API proxying, trip state polling endpoint |
 
 ## Domain Events (Kafka Integration Contract)
 
@@ -45,8 +45,11 @@ Services integrate via typed Domain Events. Event names use past-tense domain la
 |---|---|---|---|---|
 | `LocationPingReceived` | `ingest` | `tracking` (authoritative), `dispatch` (read model) | `gps-pings` | Tracking: geospatial state + ETAs; Dispatch: local matching index |
 | `TripRequested` | `dispatch` | `dispatch` (self, async) | `ride-events` | Dispatch: trigger matching |
-| `TripAssigned` | `dispatch` | `notification` | `ride-events` | Notification: log/send notification |
-| `TripCompleted` | `dispatch` | `notification` | `ride-events` | Notification: log/send notification |
+| `TripAssigned` | `dispatch` | `notification`, `gateway` | `ride-events` | Notification: push to device (best-effort); Gateway: push state to connected rider via WebSocket/SSE (primary real-time channel) |
+| `TripCancelled` | `dispatch` | `notification`, `gateway`, `tracking` | `ride-events` | Notification: push cancellation; Gateway: update rider UI; Tracking: stop ETA streaming |
+| `TripExpired` | `dispatch` | `notification`, `gateway` | `ride-events` | Notification: push expiry; Gateway: update rider UI |
+| `TripCompleted` | `dispatch` | `notification`, `gateway` | `ride-events` | Notification: push completion; Gateway: update rider UI |
+| `ETAUpdated` | `tracking` | `gateway` | `ride-events` | Gateway: stream live ETA to connected rider |
 | `NotificationDispatched` | `notification` | — | `notifications` | — |
 
 All Kafka messages include an `event_type` field in the payload to distinguish domain events on the same topic.

@@ -58,6 +58,10 @@
 - Kafka messages must include an `event_type` field to distinguish Domain Events on the same topic (e.g., `TripRequested`, `TripAssigned` on `ride-events`)
 - The `Trip` aggregate is owned exclusively by the Dispatch service — no other service reads or writes the Trip table directly
 - Cross-context queries (e.g., Dispatch querying DriverLocation) go through an internal HTTP/gRPC API, never direct DB or Redis access from another service — **exception**: Dispatch uses a CQRS local read model instead of synchronous queries (see ADR 005)
+- The Trip state machine (`REQUESTED → ASSIGNED → COMPLETED / CANCELLED`) is persisted in PostgreSQL by the Dispatch service — it is the source of truth for saga state
+- Distributed transactions use the Saga pattern: choreography for Phase 1/2 (≤5 steps, ≤3 bounded contexts), orchestration via process manager in Dispatch for Phase 3+ (see ADR 006)
+- Compensating domain events (`TripCancelled`, `TripExpired`, `PaymentFailed`) are first-class domain events — modelled in code from Phase 1 even if not triggered until Phase 2
+- See `docs/adr/006-saga-pattern-choreography-to-orchestration.md` for the full saga design, Trip state machine, and phase migration checklist
 - See `docs/adr/001-microservices-with-ddd-bounded-contexts.md` for the full decision record
 
 ## Security Constraints

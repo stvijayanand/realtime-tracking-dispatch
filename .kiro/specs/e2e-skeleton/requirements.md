@@ -18,7 +18,8 @@ The data flow is: **Driver ping → Kafka (Redpanda) → Dispatch logic → `Tri
 - **LocationPingReceived**: A Domain Event published to the `gps-pings` topic when the Ingest_Service receives a valid GPS_Ping. Payload contains `driver_id`, `latitude`, `longitude`, and `timestamp`.
 - **TripRequested**: A Domain Event published to the `ride-events` topic when the Dispatch_Service HTTP endpoint receives a ride request. Payload contains `trip_id`, `rider_id`, `pickup_location`, and `requested_at`.
 - **TripAssigned**: A Domain Event published to the `ride-events` topic when the Dispatch_Service assigns a driver to a trip. Payload contains `trip_id`, `driver_id`, `rider_id`, and `assigned_at`.
-- **Trip_Assigned_Event**: See `TripAssigned`.
+- **Trip_State_Machine**: The explicit state machine owned by the Dispatch_Service that tracks the lifecycle of a Trip aggregate. Phase 1 states: `REQUESTED`, `ASSIGNED`, `CANCELLED`. Full states defined in ADR 006.
+- **Saga_State_Monitor**: A background job in the Dispatch_Service (Phase 2) that detects trips stuck in intermediate states beyond a timeout threshold and emits compensating domain events.
 - **Ride_Request**: An HTTP request from the Rider_UI to the Dispatch_Service stub requesting a driver match. Results in a `TripRequested` Domain Event.
 - **Compose_Environment**: The local development environment defined by `docker-compose.yml`, comprising all services and infrastructure containers.
 - **OpenAPI_Spec**: The machine-readable API description (OpenAPI 3.x JSON/YAML) generated from and committed alongside each service that exposes HTTP endpoints — including both FastAPI services and the Spring Boot Dispatch_Service.
@@ -86,6 +87,8 @@ The data flow is: **Driver ping → Kafka (Redpanda) → Dispatch logic → `Tri
 13. THE Dispatch_Service SHALL consume messages from the Redpanda `gps-pings` topic using a dedicated Kafka consumer group (`dispatch-location-group`), separate from the Tracking service's consumer group. This consumer is the stub for the CQRS local read model (see ADR 005).
 14. WHEN a `LocationPingReceived` Domain Event is consumed from `gps-pings`, THE Dispatch_Service SHALL validate the event envelope (asserting `event_type` equals `"LocationPingReceived"` and `event_id` is a non-empty UUID) and log receipt to stdout at DEBUG level. In Phase 1, THE Dispatch_Service SHALL NOT yet update a Redis geospatial index — the Redis GEOADD logic is deferred to Phase 2.
 15. IF a message consumed from `gps-pings` cannot be deserialized or fails envelope validation, THE Dispatch_Service SHALL log a warning to stderr and continue consuming subsequent messages without crashing.
+16. THE Dispatch_Service SHALL persist each Trip as a record in PostgreSQL with a `status` column representing the Trip state machine. In Phase 1, valid statuses are `REQUESTED`, `ASSIGNED`, and `CANCELLED`. The `status` SHALL be set to `REQUESTED` when the `TripRequested` event is published and updated to `ASSIGNED` when the `TripAssigned` event is published.
+17. THE Dispatch_Service SHALL model `TripCancelled` as a domain event in code (event type, envelope schema) even though it is not triggered in Phase 1. This ensures the compensating event exists in the domain model before Phase 2 adds the Saga State Monitor.
 
 ---
 
