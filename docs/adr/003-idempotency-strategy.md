@@ -26,7 +26,7 @@ Idempotency must be addressed at three distinct layers: the Kafka producer, the 
 
 All Kafka producers MUST enable idempotent producer mode:
 
-- **Redpanda/Kafka config**: `enable.idempotence=true` on every producer instance
+- **Kafka (KRaft) config**: `enable.idempotence=true` on every producer instance
 - **Effect**: The broker deduplicates messages from the same producer session using a sequence number. A producer retry on network error will not result in a duplicate message within the same session.
 - **Limitation**: Does not survive producer process restart — a new session gets a new producer ID. Cross-restart deduplication requires the consumer-side dedup table (Phase 2).
 

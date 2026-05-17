@@ -1,76 +1,191 @@
 # Tech Stack
 
-> This project is in early/greenfield stage. The stack below reflects sensible defaults for a high-throughput real-time dispatch platform. Update this file as decisions are finalized.
+> This project targets FAANG-scale, production-grade distributed systems. Every technology choice is made with that bar in mind. Local dev uses docker-compose; production targets AWS EKS. Update this file as decisions are finalized.
 
-## Recommended Stack
+---
 
-### Language & Runtime
-- **Primary**: Go or Java (high concurrency, low latency) — or Node.js if team preference
-- Confirm language choice before scaffolding services
+## Language & Runtime
 
-### Message Streaming
-- **Apache Kafka** — ingestion of GPS pings at scale, event-driven state changes
+| Service | Language | Rationale |
+|---|---|---|
+| `ingest` | **Go** | True goroutine concurrency, sub-ms HTTP latency, handles 10k+ concurrent GPS pings per instance. Single static binary in a distroless image. |
+| `dispatch` | **Java 21 (Spring Boot 3.x)** | Virtual threads (Project Loom) give Go-level concurrency with JPA/JDBC ecosystem. Owns the stateful Trip aggregate and PostgreSQL writes. |
+| `tracking` | **Go** | High-frequency geospatial computation, Redis GEOADD writes at GPS ping rate. |
+| `notification` | **Go** | Fire-and-forget Kafka consumer + FCM/APNs HTTP calls. No state, no DB. |
+| `gateway` | **Go** | Manages 100k+ long-lived WebSocket connections per instance. gorilla/websocket or nhooyr.io/websocket. |
+
+**Why not Python**: The GIL limits true parallelism. Python FastAPI is fine for demos but cannot sustain 10k+ concurrent GPS pings per instance without horizontal scaling that Go handles in a single process.
+
+---
+
+## Message Streaming
+
+### Apache Kafka (KRaft mode) — Primary event bus
+
+- **Local dev**: 3-broker KRaft cluster in docker-compose (`confluentinc/cp-kafka:7.6.1`), no ZooKeeper
+- **Production**: AWS MSK (Managed Streaming for Kafka) — fully managed, multi-AZ, KRaft-native from MSK 2.x
+- **Replication**: `replication.factor=3`, `min.insync.replicas=2` on all topics — demonstrates fault tolerance
+- **Producer config**: `acks=all`, `enable.idempotence=true` on every producer
+- **Schema enforcement**: Confluent Schema Registry + **Avro** for all Domain Events — schema evolution with backward/forward compatibility enforced at publish time; broker rejects malformed messages before they reach consumers
 - Topics: `gps-pings`, `ride-events`, `dispatch-commands`, `notifications`
 
-### Databases
-- **Redis** — geospatial indexing for driver locations (`GEOADD`/`GEORADIUS`), ETA caching, session state
-- **PostgreSQL** — persistent storage for orders, rides, users, audit logs
-- **TimescaleDB** (optional) — time-series GPS history if analytics are needed
+### AWS Kinesis — Analytics / GPS history pipeline (Phase 2)
 
-### Real-Time Streaming to Clients
-- **WebSockets** or **Server-Sent Events (SSE)** — push ETA updates to customer apps
-- Consider a dedicated gateway service (e.g., using Socket.IO or native WS)
+- GPS pings are dual-published: Kafka for real-time processing, Kinesis Data Streams for the analytics pipeline
+- Kinesis Firehose delivers to S3 → Athena for historical GPS track queries
+- Demonstrates the Kafka vs. Kinesis trade-off: Kafka for low-latency event-driven microservices; Kinesis for high-volume stream-to-storage pipelines
+- Kinesis shard key = `driver_id` (same ordering guarantee as Kafka partition key)
 
-### Push Notifications
-- **Firebase Cloud Messaging (FCM)** — mobile push notifications
-- Wrap in an internal notification service to abstract provider
+**Kafka vs. Kinesis decision boundary**: All inter-service Domain Events use Kafka. Kinesis is used exclusively for the analytics/data-lake pipeline where managed throughput scaling (shard splitting) and native AWS integration (Firehose → S3) are more valuable than Kafka's consumer group flexibility.
 
-### Infrastructure
-- **Docker** — containerization for all services
-- **Kubernetes** — orchestration at scale
-- **API Gateway** — single entry point for external clients (e.g., Kong, AWS API Gateway)
+---
 
-## Common Commands
+## Data Storage
 
-> Populate these as the project is scaffolded.
+### PostgreSQL — Trip aggregate, audit log (Dispatch Service)
 
-```bash
-# Build
-# e.g., go build ./... or mvn package
+- **Local dev**: `postgres:16-alpine` (pinned)
+- **Production**: AWS RDS PostgreSQL Multi-AZ with read replicas
+- **Connection pooling**: **PgBouncer** in transaction pooling mode between Dispatch Service and PostgreSQL — multiplexes thousands of application connections onto a small pool of actual DB connections. This is the production failure mode PostgreSQL hits before CPU does.
+- **Query optimization**: All queries on the `trips` table use covering indexes. `idx_trips_status` and `idx_trips_updated_at` are defined from Phase 1. `EXPLAIN ANALYZE` output is committed alongside any new query in a `docs/query-plans/` directory.
+- **Schema migrations**: Flyway (Java) — versioned, repeatable, baseline migrations. Never run raw DDL in application code.
 
-# Run locally
-# e.g., docker-compose up
+### Redis — Geospatial driver index, ETA cache, WebSocket session registry
 
-# Run tests
-# e.g., go test ./... or mvn test
+- **Local dev**: `redis:7.2-alpine` (pinned), password-protected
+- **Production**: AWS ElastiCache for Redis (cluster mode enabled, Multi-AZ)
+- **Geospatial**: `GEOADD dispatch:drivers <lng> <lat> <driver_id>` — Dispatch Service CQRS read model (Phase 2). `GEORADIUS` for nearest-driver queries.
+- **ETA cache**: `SET eta:{trip_id} <seconds> EX 30` — 30-second TTL, refreshed on each `ETAUpdated` event
+- **WebSocket session registry**: `HSET gateway:sessions:{rider_id} instance_id connection_id` — enables multi-instance Gateway fan-out via Redis Pub/Sub. Phase 1 uses in-memory map; Phase 2 uses Redis.
 
-# Lint
-# e.g., golangci-lint run
+### DynamoDB — Notification delivery log, idempotency table (Phase 2)
+
+- **Use case**: The Notification Service's `processed_events` deduplication table (ADR 003) is a natural DynamoDB fit — high write throughput, single-key lookups, TTL-based expiry, no relational joins needed.
+- **Schema**: `PK=event_id`, `TTL=processed_at + 24h`. `ConditionExpression: attribute_not_exists(event_id)` on write — atomic idempotency check without a distributed lock.
+- **Why not PostgreSQL**: The deduplication table is write-heavy (one write per consumed Kafka message), append-only, and never queried relationally. DynamoDB's single-digit millisecond writes at any scale are the right fit. PostgreSQL would become a bottleneck here at high message rates.
+- **Local dev**: DynamoDB Local (`amazon/dynamodb-local`) in docker-compose — identical API, no AWS account needed for local testing.
+
+---
+
+## Real-Time Client Streaming
+
+### Gateway Service — WebSocket/SSE hub (Kafka consumer + protocol bridge)
+
+The Gateway is a **Kafka consumer** like any other bounded context. Kafka fans out events to it via a dedicated consumer group (`gateway-consumer-group`). The Gateway's sole job is **protocol translation**: Kafka Domain Event → WebSocket frame pushed to the connected rider client.
+
 ```
+Kafka ride-events topic
+    ├── dispatch-consumer-group  → Dispatch Service
+    ├── notification-consumer-group → Notification Service
+    └── gateway-consumer-group  → Gateway Service
+                                      → session registry lookup: rider_id → WebSocket conn
+                                      → push event payload over WebSocket
+                                      → Rider UI receives live update
+```
+
+The Gateway does **not** fan out events — Kafka does. The Gateway translates protocol and routes to the correct connection. It owns:
+- WebSocket connection lifecycle (accept, heartbeat, graceful disconnect)
+- Session registry: `rider_id → WebSocket connection` (in-memory Phase 1, Redis Pub/Sub Phase 2 for multi-instance)
+- Kafka consumer for `ride-events` (`TripAssigned`, `TripCancelled`, `TripCompleted`) and `ETAUpdated`
+- No domain logic, no DB writes — pure infrastructure
+
+**Why a dedicated Gateway service**: Separates stateful long-lived connections (WebSocket) from stateless request/response services. Allows independent scaling — you scale Gateway instances for connection count, Dispatch instances for trip throughput.
+
+---
+
+## Observability (OpenTelemetry — from Phase 1)
+
+Production systems are not observable by accident. OTel is instrumented from the first service, not retrofitted.
+
+- **Traces**: `trace_id` and `span_id` propagated through Kafka message headers — every hop (HTTP → Kafka produce → Kafka consume → DB write) is a span in the same trace. A single GPS ping is traceable end-to-end.
+- **Metrics**: Prometheus-format `/metrics` endpoint on every service — Kafka consumer lag, HTTP p50/p95/p99 latency, DB query duration, WebSocket connection count
+- **Logs**: Structured JSON with `trace_id` field — logs correlate to traces in Jaeger/Grafana
+- **Local dev**: Jaeger (traces) + Prometheus + Grafana in docker-compose
+- **Production**: AWS X-Ray (traces) + Amazon Managed Prometheus + Grafana
+
+---
+
+## Infrastructure
+
+### Local Development
+- **docker-compose** — single `docker-compose up` starts the full stack: 3-broker Kafka cluster, Schema Registry, PostgreSQL + PgBouncer, Redis, DynamoDB Local, Jaeger, Prometheus, Grafana, all services
+
+### Production
+- **AWS EKS** (Elastic Kubernetes Service) — managed Kubernetes, integrates with IAM, ALB Ingress Controller, EBS/EFS volumes
+- **Horizontal Pod Autoscaler (HPA)** on all services — scale on CPU and custom metrics (Kafka consumer lag via KEDA)
+- **KEDA** (Kubernetes Event-Driven Autoscaling) — scales Kafka consumer pods based on consumer group lag. Ingest scales on `gps-pings` lag; Notification scales on `ride-events` lag.
+- **AWS ALB Ingress Controller** — replaces Kong for production; handles TLS termination, path-based routing, WAF integration
+- **Kong** — API Gateway for local dev and staging; JWT validation, rate limiting, request logging
+
+### Container Standards
+- All Dockerfiles use **distroless** or `scratch` base images for Go services — no shell, no package manager, minimal attack surface
+- Java services use `eclipse-temurin:21-jre-jammy` (pinned digest)
+- All containers run as non-root users
+- Multi-stage builds: build stage compiles, final stage copies only the binary
+
+---
+
+## Secrets Management
+
+| Environment | Mechanism |
+|---|---|
+| Local dev | `.env` file (gitignored), loaded from `.env.example` |
+| Staging / Production | **AWS Secrets Manager** — services fetch secrets at startup via AWS SDK; IAM role-based access (no static credentials in containers); secret rotation without container restarts |
+
+**Why AWS Secrets Manager over HashiCorp Vault**: Native AWS integration with EKS IAM roles for service accounts (IRSA) — no Vault agent sidecar needed. Secrets are fetched via the AWS SDK using the pod's IAM role. Rotation hooks integrate directly with RDS and ElastiCache.
+
+---
 
 ## Key Architectural Constraints
 
 - All GPS ping ingestion must go through Kafka — never write directly to DB from the ingest endpoint
-- Driver location state lives in Redis; PostgreSQL is the source of truth for order/ride records
-- Services communicate asynchronously via Kafka Domain Events; synchronous REST/gRPC only for cross-context query paths
-- Push notifications must be fire-and-forget with retry logic — never block the dispatch critical path
-- Each service is a Bounded Context — domain objects (Trip, DriverLocation, Notification) are never shared via a common library; only infrastructure types live in `shared/`
-- Kafka messages must include an `event_type` field to distinguish Domain Events on the same topic (e.g., `TripRequested`, `TripAssigned` on `ride-events`)
-- The `Trip` aggregate is owned exclusively by the Dispatch service — no other service reads or writes the Trip table directly
-- Cross-context queries (e.g., Dispatch querying DriverLocation) go through an internal HTTP/gRPC API, never direct DB or Redis access from another service — **exception**: Dispatch uses a CQRS local read model instead of synchronous queries (see ADR 005)
-- The Trip state machine (`REQUESTED → ASSIGNED → COMPLETED / CANCELLED`) is persisted in PostgreSQL by the Dispatch service — it is the source of truth for saga state
-- Distributed transactions use the Saga pattern: choreography for Phase 1/2 (≤5 steps, ≤3 bounded contexts), orchestration via process manager in Dispatch for Phase 3+ (see ADR 006)
-- Compensating domain events (`TripCancelled`, `TripExpired`, `PaymentFailed`) are first-class domain events — modelled in code from Phase 1 even if not triggered until Phase 2
-- See `docs/adr/006-saga-pattern-choreography-to-orchestration.md` for the full saga design, Trip state machine, and phase migration checklist
-- See `docs/adr/001-microservices-with-ddd-bounded-contexts.md` for the full decision record
+- Driver location state lives in Redis; PostgreSQL is the source of truth for Trip/order records
+- Services communicate asynchronously via Kafka Domain Events; synchronous REST/gRPC only for non-hot-path operations (health checks, admin queries)
+- **Kafka fans out events to consumer groups** — the Gateway Service is a Kafka consumer like any other; it does not fan out events, it translates Kafka events to WebSocket frames
+- Push notifications are fire-and-forget with retry logic — never block the dispatch critical path
+- Each service is a Bounded Context — domain objects never shared via common library; only infrastructure types in `shared/`
+- Kafka messages use Avro schema (Schema Registry) — `event_type` field in envelope distinguishes Domain Events on the same topic
+- The `Trip` aggregate is owned exclusively by the Dispatch service
+- The Dispatch service maintains a local CQRS read model of driver locations (Redis GEOADD) by consuming `LocationPingReceived` events — never calls Tracking synchronously (see ADR 005)
+- The Trip state machine is persisted in PostgreSQL by the Dispatch service — source of truth for saga state
+- Distributed transactions use the Saga pattern: choreography Phase 1/2, orchestration Phase 3+ (see ADR 006)
+- Compensating domain events (`TripCancelled`, `TripExpired`, `PaymentFailed`) are first-class domain events — modelled in code from Phase 1
+- DynamoDB is used for high-write-throughput, single-key-lookup tables (notification dedup, idempotency) — not for relational data
+- All query plans for PostgreSQL queries must be documented with `EXPLAIN ANALYZE` output in `docs/query-plans/`
 
 ## Security Constraints
 
-- No secrets, passwords, or API keys in source control — ever. Use `.env` (gitignored) loaded from `.env.example`
-- All service configuration (broker addresses, credentials, ports) via environment variables — no hardcoded defaults
-- Each service has its own Kafka SASL credentials with ACLs restricted to only the topics it owns (principle of least privilege)
-- Docker Compose named networks segment traffic: services only join networks they require (`kafka-net`, `db-net`, `frontend-net`)
-- All Dockerfiles run as non-root users and use pinned base image versions — never `latest`
-- All HTTP endpoints enforce a 64 KB maximum request body size
-- Services must fail fast with a descriptive error if a required environment variable is missing — never start with insecure defaults
-- See `docs/adr/004-security-model.md` for the full security model, threat model, and Phase 2 controls (JWT auth, TLS, rate limiting)
+- No secrets in source control — ever. `.env` gitignored, `.env.example` committed
+- Production secrets via AWS Secrets Manager with IRSA (IAM Roles for Service Accounts)
+- Each service has its own Kafka SASL credentials with ACLs restricted to only the topics it owns
+- Docker Compose named networks segment traffic: `kafka-net`, `db-net`, `frontend-net`
+- All Dockerfiles run as non-root users with pinned base image versions
+- All HTTP endpoints enforce 64 KB maximum request body size
+- Services fail fast with a descriptive error if a required environment variable is missing
+- Phase 2: mTLS between services and Kafka (MSK TLS listener); JWT auth at Gateway; rate limiting via Kong/ALB WAF
+- See `docs/adr/004-security-model.md` for the full security model and phase controls
+
+## Common Commands
+
+```bash
+# Start full local stack
+docker-compose up
+
+# Build all Go services
+make build
+
+# Run all tests
+make test
+
+# Run a specific service
+docker-compose up ingest
+
+# Kafka topic list (local)
+docker exec kafka-1 kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+# View traces
+open http://localhost:16686  # Jaeger UI
+
+# View metrics
+open http://localhost:3000   # Grafana
+```

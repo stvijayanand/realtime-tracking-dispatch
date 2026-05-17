@@ -44,7 +44,9 @@ POSTGRES_DB=dispatch_db
 # Redis
 REDIS_PASSWORD=changeme
 
-# Redpanda SASL (per-service credentials)
+# Kafka SASL (per-service credentials)
+KAFKA_ADMIN_USERNAME=admin
+KAFKA_ADMIN_PASSWORD=changeme
 KAFKA_INGEST_USERNAME=ingest-service
 KAFKA_INGEST_PASSWORD=changeme
 KAFKA_DISPATCH_USERNAME=dispatch-service
@@ -66,7 +68,7 @@ Docker Compose named networks segment traffic so services only reach what they n
 
 **Network topology:**
 ```
-kafka-net:      redpanda, ingest, dispatch, notification
+kafka-net:      kafka, ingest, dispatch, notification
 db-net:         postgres, redis, dispatch
 frontend-net:   dispatch (port 8080 only), rider-ui
 ```
@@ -74,13 +76,13 @@ frontend-net:   dispatch (port 8080 only), rider-ui
 - The Notification Service has no access to `db-net` — it cannot reach PostgreSQL or Redis directly
 - The Ingest Service has no access to `db-net` — it only writes to Kafka
 - The Rider UI has no access to `kafka-net` or `db-net` — it only reaches the Dispatch HTTP endpoint
-- No service exposes ports to the host except the three defined service ports (8001, 8080, 8002) and the Redpanda admin port (8081, localhost-only)
+- No service exposes ports to the host except the three defined service ports (8001, 8080, 8002) and the Kafka admin port (9093 controller, localhost-only)
 
 **Phase 2:** Kubernetes NetworkPolicy resources enforce the same isolation at the pod level. Egress is deny-by-default; only explicitly allowed routes are permitted.
 
 ### Layer 3: Kafka Authorization — SASL/PLAIN (Phase 1)
 
-Redpanda supports SASL/PLAIN authentication out of the box. Each service gets its own credentials with topic-level ACLs.
+Apache Kafka (KRaft mode) supports SASL/PLAIN authentication. Each service gets its own credentials with topic-level ACLs.
 
 **Per-service Kafka ACLs:**
 
@@ -92,9 +94,9 @@ Redpanda supports SASL/PLAIN authentication out of the box. Each service gets it
 
 No service has wildcard topic access. A compromised Ingest Service cannot read ride events or produce to notification topics.
 
-**Redpanda superuser** (for topic creation at startup): a separate `admin` credential used only by the Redpanda init container. Not shared with any application service.
+**Kafka superuser** (for topic creation at startup): a separate `admin` credential used only by the Kafka init container or topic-creation script. Not shared with any application service.
 
-**Phase 2:** Migrate to mTLS (mutual TLS) between services and Redpanda. SASL/PLAIN is acceptable for the local dev environment; mTLS is required for staging and production.
+**Phase 2:** Migrate to mTLS (mutual TLS) between services and Kafka. SASL/PLAIN is acceptable for the local dev environment; mTLS is required for staging and production.
 
 ### Layer 4: Transport Security (Phase 1 → Phase 2)
 
@@ -102,7 +104,7 @@ No service has wildcard topic access. A compromised Ingest Service cannot read r
 
 **Phase 2 (staging/production):**
 - TLS termination at the API Gateway for all external traffic
-- mTLS between services and Redpanda
+- mTLS between services and Kafka
 - TLS on PostgreSQL and Redis connections
 - All internal service-to-service HTTP uses HTTPS
 
@@ -152,13 +154,13 @@ The Phase 1 skeleton has no authentication — it is a local dev tool, not expos
 | No secrets in source control | Secrets | **Phase 1** | `.env` gitignored, `.env.example` committed |
 | Per-service DB/Redis passwords | Secrets | **Phase 1** | `.env` variables, no shared credentials |
 | Docker network segmentation | Network | **Phase 1** | Named networks with per-service membership |
-| Kafka SASL/PLAIN per-service credentials | Kafka Auth | **Phase 1** | Redpanda ACLs, per-service username/password |
+| Kafka SASL/PLAIN per-service credentials | Kafka Auth | **Phase 1** | Kafka KRaft ACLs, per-service username/password |
 | Non-root container users | Container | **Phase 1** | `USER` directive in all Dockerfiles |
 | Pinned base image digests | Container | **Phase 1** | Specific version tags, no `latest` |
 | Request body size cap (64 KB) | Input | **Phase 1** | FastAPI/Spring middleware |
 | Field length validation | Input | **Phase 1** | Request schema validation |
 | TLS termination at Gateway | Transport | Phase 2 | Gateway TLS, internal plaintext on private net |
-| mTLS to Redpanda | Transport | Phase 2 | Redpanda TLS listener |
+| mTLS to Kafka | Transport | Phase 2 | Kafka TLS listener |
 | JWT authentication | Auth | Phase 2 | Auth Service, Gateway validation |
 | Driver/rider identity binding | AuthZ | Phase 2 | JWT `sub` claim == request identity field |
 | Rate limiting | Input | Phase 2 | Token bucket at Gateway |
@@ -174,7 +176,7 @@ The Phase 1 skeleton has no authentication — it is a local dev tool, not expos
 |---|---|---|---|
 | No JWT authentication | Any process can post as any driver/rider | Yes — local dev only, not exposed to real users | Document clearly; block external access via network isolation |
 | Plaintext HTTP between containers | Traffic visible on Docker network | Yes — isolated Docker network, no external exposure | Phase 2 adds TLS |
-| SASL/PLAIN (not mTLS) to Redpanda | Credentials transmitted in plaintext within Docker network | Yes — acceptable for local dev | Phase 2 migrates to mTLS |
+| SASL/PLAIN (not mTLS) to Kafka | Credentials transmitted in plaintext within Docker network | Yes — acceptable for local dev | Phase 2 migrates to mTLS |
 | No rate limiting | Simulator or test can flood the Ingest Service | Yes — controlled dev environment | Smoke test validates at 10 pings/sec only |
 
 ---
@@ -197,7 +199,7 @@ The Phase 1 skeleton has no authentication — it is a local dev tool, not expos
 ## References
 
 - [OWASP API Security Top 10](https://owasp.org/www-project-api-security/)
-- [Redpanda SASL/PLAIN Authentication](https://docs.redpanda.com/docs/manage/security/authentication/)
+- [Apache Kafka Security — SASL/PLAIN](https://kafka.apache.org/documentation/#security_sasl_plain)
 - [Docker Network Security](https://docs.docker.com/network/)
 - [JWT Best Practices — RFC 8725](https://www.rfc-editor.org/rfc/rfc8725)
 - [HashiCorp Vault](https://developer.hashicorp.com/vault)

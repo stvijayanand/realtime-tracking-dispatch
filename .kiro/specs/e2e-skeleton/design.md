@@ -8,7 +8,7 @@ The pipeline is:
 
 ```
 Driver GPS Ping → POST /location (Ingest Service)
-  → LocationPingReceived event → gps-pings topic (Redpanda)
+  → LocationPingReceived event → gps-pings topic (Kafka KRaft)
     → [Dispatch Service consumes gps-pings — stub, logs only]
     → [Tracking Service — deferred to Phase 2]
 
@@ -48,7 +48,7 @@ graph TD
         INGEST["Ingest Service\nFastAPI :8001\nPOST /location"]
         DISPATCH["Dispatch Service\nSpring Boot :8080\nPOST /request-ride"]
         NOTIF["Notification Service\nFastAPI :8002\nGET /health"]
-        RP["Redpanda\n(Kafka-compatible)\n:9092 SASL/PLAIN"]
+        RP["Apache Kafka (KRaft)\n:9092 SASL/PLAIN"]
     end
 
     subgraph dbnet["docker-compose (db-net)"]
@@ -71,7 +71,7 @@ graph TD
 ### Network Segmentation
 
 ```
-kafka-net:    redpanda, ingest-service, dispatch-service, notification-service
+kafka-net:    kafka, ingest-service, dispatch-service, notification-service
 db-net:       postgres, redis, dispatch-service
 frontend-net: dispatch-service, rider-ui
 ```

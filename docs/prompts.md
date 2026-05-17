@@ -103,7 +103,16 @@ How does the rider know if notification fails that a driver has been assigned?
 
 I'd like you to implement best practices including Low level design patterns.
 
+## Kraft or ZooKeper
 
+For Kafka, will we need KRaft (Kafka Raft) for coordination?
 
+### Redpanda -> Kafka + KRaft
+
+I'd like to use Kafka with Kraft, instead. Please update. everywhere.
+
+## My primary goal
+
+I have asked you to move from Redpanda to Kafka + KRaft because I want to build FAANG scale, production-grade, real-world distributed systems that I can demonstrate. I want you to keep this in mind and suggest better technologies/design wherever you see fit. Make the suggestions ongoing as we build iteratively.
 
 

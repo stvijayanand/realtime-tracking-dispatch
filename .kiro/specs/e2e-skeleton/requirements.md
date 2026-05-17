@@ -4,7 +4,7 @@
 
 The e2e-skeleton feature establishes the foundational end-to-end data flow for the Real-Time Ride/Delivery Tracking & Dispatch Platform. The goal is to prove that a single driver GPS ping can travel through the full pipeline — from ingestion through dispatch logic to a rider notification — all running locally in docker-compose. This skeleton deliberately avoids Kubernetes, Flink, and production-grade push notification providers; it validates the core architecture before complexity is added.
 
-The data flow is: **Driver ping → Kafka (Redpanda) → Dispatch logic → `TripAssigned` Domain Event → Notification logged to stdout**.
+The data flow is: **Driver ping → Kafka (KRaft mode) → Dispatch logic → `TripAssigned` Domain Event → Notification logged to stdout**.
 
 ## Glossary
 
@@ -13,7 +13,7 @@ The data flow is: **Driver ping → Kafka (Redpanda) → Dispatch logic → `Tri
 - **Notification_Service**: The FastAPI service that consumes `TripAssigned` Domain Events and logs notifications to stdout.
 - **Driver_Simulator**: The Python script that emits GPS pings at a configurable rate along a GeoJSON route.
 - **Rider_UI**: The minimal React single-page application that displays a static map and allows a rider to request a ride.
-- **Redpanda**: The Kafka-compatible message broker running as a local Docker container.
+- **Kafka_Broker**: The Apache Kafka broker running in KRaft mode as a local Docker container. KRaft (Kafka Raft) eliminates the ZooKeeper dependency — the broker acts as both broker and controller using the built-in Raft consensus protocol (`KAFKA_PROCESS_ROLES=broker,controller`).
 - **GPS_Ping**: A single location update message containing a driver identifier, latitude, longitude, and timestamp.
 - **LocationPingReceived**: A Domain Event published to the `gps-pings` topic when the Ingest_Service receives a valid GPS_Ping. Payload contains `driver_id`, `latitude`, `longitude`, and `timestamp`.
 - **TripRequested**: A Domain Event published to the `ride-events` topic when the Dispatch_Service HTTP endpoint receives a ride request. Payload contains `trip_id`, `rider_id`, `pickup_location`, and `requested_at`.
@@ -53,7 +53,7 @@ The data flow is: **Driver ping → Kafka (Redpanda) → Dispatch logic → `Tri
 #### Acceptance Criteria
 
 1. THE Ingest_Service SHALL expose a `POST /location` HTTP endpoint accepting a JSON body containing `driver_id` (string), `latitude` (float, −90 to 90), `longitude` (float, −180 to 180), and `timestamp` (ISO 8601 string).
-2. WHEN a valid GPS_Ping is received, THE Ingest_Service SHALL publish a `LocationPingReceived` Domain Event as a JSON message to the Redpanda `gps-pings` topic within 500 ms of receiving the HTTP request. The message SHALL conform to the standard Domain Event envelope: `event_id` (UUID, generated at publish time), `event_type` (set to `"LocationPingReceived"`), `occurred_at` (ISO 8601 timestamp), and `payload` containing `driver_id`, `latitude`, `longitude`, and `timestamp`.
+2. WHEN a valid GPS_Ping is received, THE Ingest_Service SHALL publish a `LocationPingReceived` Domain Event as a JSON message to the Kafka `gps-pings` topic within 500 ms of receiving the HTTP request. The message SHALL conform to the standard Domain Event envelope: `event_id` (UUID, generated at publish time), `event_type` (set to `"LocationPingReceived"`), `occurred_at` (ISO 8601 timestamp), and `payload` containing `driver_id`, `latitude`, `longitude`, and `timestamp`.
 3. WHEN the `gps-pings` topic is unavailable, THE Ingest_Service SHALL return HTTP 503 and SHALL NOT silently drop the ping.
 4. IF the request body is missing any required field, THEN THE Ingest_Service SHALL return HTTP 422 with a structured error body identifying the missing fields.
 5. IF `latitude` is outside the range −90 to 90 or `longitude` is outside the range −180 to 180, THEN THE Ingest_Service SHALL return HTTP 422.
@@ -72,7 +72,7 @@ The data flow is: **Driver ping → Kafka (Redpanda) → Dispatch logic → `Tri
 
 #### Acceptance Criteria
 
-1. THE Dispatch_Service SHALL consume messages from the Redpanda `ride-events` topic using a Kafka consumer group, filtering for messages with `event_type` equal to `"TripRequested"`.
+1. THE Dispatch_Service SHALL consume messages from the Kafka `ride-events` topic using a Kafka consumer group, filtering for messages with `event_type` equal to `"TripRequested"`.
 2. WHEN a `TripRequested` Domain Event is consumed, THE Dispatch_Service SHALL apply hardcoded nearest-driver logic that selects a driver identifier from a static in-memory list.
 3. WHEN a driver is selected, THE Dispatch_Service SHALL publish a `TripAssigned` Domain Event to the `ride-events` topic conforming to the standard envelope: `event_id` (UUID, generated at publish time), `event_type` (set to `"TripAssigned"`), `occurred_at` (ISO 8601 timestamp), and `payload` containing `trip_id` (UUID), `driver_id` (string), `rider_id` (string), and `assigned_at` (ISO 8601 timestamp).
 4. THE Dispatch_Service SHALL also expose a `POST /request-ride` HTTP endpoint that accepts a JSON body with `rider_id` (string) and `pickup_location` (object with `latitude` and `longitude`), publishes a `TripRequested` Domain Event to `ride-events` conforming to the standard envelope with `payload` containing `trip_id`, `rider_id`, `pickup_location`, and `requested_at`, and returns HTTP 202 with a `trip_id`.
@@ -84,7 +84,7 @@ The data flow is: **Driver ping → Kafka (Redpanda) → Dispatch logic → `Tri
 10. THE Dispatch_Service Kafka producer SHALL be configured with `enable.idempotence=true` to prevent duplicate message delivery within a producer session.
 11. THE Dispatch_Service SHALL enforce a maximum request body size of 64 KB on `POST /request-ride`, returning HTTP 413 if exceeded.
 12. THE Dispatch_Service Dockerfile SHALL run the service process as a non-root user and SHALL use a pinned base image version (not `latest`).
-13. THE Dispatch_Service SHALL consume messages from the Redpanda `gps-pings` topic using a dedicated Kafka consumer group (`dispatch-location-group`), separate from the Tracking service's consumer group. This consumer is the stub for the CQRS local read model (see ADR 005).
+13. THE Dispatch_Service SHALL consume messages from the Kafka `gps-pings` topic using a dedicated Kafka consumer group (`dispatch-location-group`), separate from the Tracking service's consumer group. This consumer is the stub for the CQRS local read model (see ADR 005).
 14. WHEN a `LocationPingReceived` Domain Event is consumed from `gps-pings`, THE Dispatch_Service SHALL validate the event envelope (asserting `event_type` equals `"LocationPingReceived"` and `event_id` is a non-empty UUID) and log receipt to stdout at DEBUG level. In Phase 1, THE Dispatch_Service SHALL NOT yet update a Redis geospatial index — the Redis GEOADD logic is deferred to Phase 2.
 15. IF a message consumed from `gps-pings` cannot be deserialized or fails envelope validation, THE Dispatch_Service SHALL log a warning to stderr and continue consuming subsequent messages without crashing.
 16. THE Dispatch_Service SHALL persist each Trip as a record in PostgreSQL with a `status` column representing the Trip state machine. In Phase 1, valid statuses are `REQUESTED`, `ASSIGNED`, and `CANCELLED`. The `status` SHALL be set to `REQUESTED` when the `TripRequested` event is published and updated to `ASSIGNED` when the `TripAssigned` event is published.
@@ -98,7 +98,7 @@ The data flow is: **Driver ping → Kafka (Redpanda) → Dispatch logic → `Tri
 
 #### Acceptance Criteria
 
-1. THE Notification_Service SHALL consume messages from the Redpanda `ride-events` topic using a dedicated Kafka consumer group distinct from the Dispatch_Service consumer group.
+1. THE Notification_Service SHALL consume messages from the Kafka `ride-events` topic using a dedicated Kafka consumer group distinct from the Dispatch_Service consumer group.
 2. WHEN a `TripAssigned` Domain Event is consumed, THE Notification_Service SHALL log a structured JSON line to stdout containing `event_id`, `event_type`, `trip_id`, `driver_id`, `rider_id`, `assigned_at`, and a `notification_sent_at` timestamp.
 3. THE Notification_Service SHALL filter consumed messages and SHALL only act on messages whose `event_type` is `"TripAssigned"`; all other event types SHALL be acknowledged and skipped without logging an error.
 4. IF a consumed message cannot be deserialized as valid JSON, THEN THE Notification_Service SHALL log a warning to stderr including the raw message bytes and SHALL continue consuming subsequent messages.
@@ -147,15 +147,15 @@ The data flow is: **Driver ping → Kafka (Redpanda) → Dispatch logic → `Tri
 
 #### Acceptance Criteria
 
-1. THE Compose_Environment SHALL include containers for: Redpanda (Kafka-compatible broker), Redis, PostgreSQL, Ingest_Service, Dispatch_Service, and Notification_Service.
+1. THE Compose_Environment SHALL include containers for: Apache Kafka (KRaft mode), Redis, PostgreSQL, Ingest_Service, Dispatch_Service, and Notification_Service.
 2. WHEN `docker-compose up` is executed from the repository root, THE Compose_Environment SHALL reach a healthy state with all services passing their health checks within 120 seconds on a standard developer laptop.
-3. THE Compose_Environment SHALL define a Redpanda container that creates the Kafka topics `gps-pings`, `ride-events`, `dispatch-commands`, and `notifications` on first startup.
+3. THE Compose_Environment SHALL define a Kafka (KRaft mode) container that creates the Kafka topics `gps-pings`, `ride-events`, `dispatch-commands`, and `notifications` on first startup.
 4. THE Compose_Environment SHALL configure all inter-service hostnames and ports via environment variables injected into each service container; no service SHALL hardcode another service's hostname.
 5. THE Compose_Environment SHALL define named Docker volumes for Redis and PostgreSQL data so that data persists across `docker-compose stop` / `docker-compose start` cycles.
 6. WHEN any service container exits with a non-zero status code, THE Compose_Environment SHALL surface the failure in the `docker-compose up` output without silently restarting the failed container indefinitely.
 7. THE Compose_Environment SHALL expose the Ingest_Service on host port 8001, the Dispatch_Service on host port 8080, and the Notification_Service on host port 8002, so that the Driver_Simulator and Rider_UI can reach them from the host machine.
-8. THE Compose_Environment SHALL define three named Docker networks: `kafka-net` (Redpanda + all services), `db-net` (PostgreSQL + Redis + Dispatch_Service only), and `frontend-net` (Dispatch_Service + Rider_UI only). No service SHALL be connected to a network it does not require.
-9. THE Compose_Environment SHALL configure Redpanda with SASL/PLAIN authentication enabled. Each service SHALL authenticate to Redpanda using its own dedicated credentials loaded from environment variables. No service SHALL share credentials with another service.
+8. THE Compose_Environment SHALL define three named Docker networks: `kafka-net` (Kafka broker + all services), `db-net` (PostgreSQL + Redis + Dispatch_Service only), and `frontend-net` (Dispatch_Service + Rider_UI only). No service SHALL be connected to a network it does not require.
+9. THE Compose_Environment SHALL configure Kafka with SASL/PLAIN authentication enabled. Each service SHALL authenticate to Kafka using its own dedicated credentials loaded from environment variables. No service SHALL share credentials with another service.
 10. THE Compose_Environment SHALL set non-empty passwords on PostgreSQL and Redis, loaded from environment variables. No service SHALL connect to PostgreSQL or Redis without a password.
 
 ---
@@ -184,7 +184,7 @@ The data flow is: **Driver ping → Kafka (Redpanda) → Dispatch logic → `Tri
 1. THE Monorepo SHALL NOT contain any credentials, passwords, API keys, or secrets in any committed file. All secrets SHALL be loaded from environment variables at runtime.
 2. THE `.env.example` file SHALL document every environment variable required to run the Compose_Environment, with placeholder values and comments explaining each variable's purpose.
 3. THE `docker-compose.yml` SHALL reference all credentials via `${VAR_NAME}` environment variable substitution — no hardcoded passwords or usernames.
-4. THE Compose_Environment SHALL configure Redpanda with SASL/PLAIN authentication. Each service SHALL have its own Kafka username and password with ACLs restricted to only the topics it needs to produce or consume (see ADR 004).
+4. THE Compose_Environment SHALL configure Kafka with SASL/PLAIN authentication. Each service SHALL have its own Kafka username and password with ACLs restricted to only the topics it needs to produce or consume (see ADR 004).
 5. THE Compose_Environment SHALL assign each service to only the Docker networks it requires: `kafka-net` for Kafka access, `db-net` for database access, `frontend-net` for external HTTP access. No service SHALL have access to networks it does not use.
 6. ALL service Dockerfiles SHALL run the application process as a non-root user using a `USER` directive.
 7. ALL service Dockerfiles SHALL use pinned base image versions (e.g., `python:3.11.9-slim`, `eclipse-temurin:21-jre-jammy`) — never floating tags such as `latest`.

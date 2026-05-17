@@ -189,8 +189,8 @@ LLD reference: All tasks below reference the exact module structures, design pat
     - _Requirements: 6.6, 10.6, 10.7_
 
 - [ ] 8. docker-compose local environment
-  - [ ] 8.1 Define infrastructure containers (Redpanda, PostgreSQL, Redis)
-    - Add Redpanda container to `docker-compose.yml` with SASL/PLAIN authentication enabled; configure it to create topics `gps-pings`, `ride-events`, `dispatch-commands`, and `notifications` on first startup
+  - [ ] 8.1 Define infrastructure containers (Kafka KRaft, PostgreSQL, Redis)
+    - Add Apache Kafka container to `docker-compose.yml` running in KRaft mode (single-node combined broker+controller: `KAFKA_PROCESS_ROLES=broker,controller`, `KAFKA_NODE_ID=1`, `KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093`); use `confluentinc/cp-kafka:7.6.1` (pinned); configure SASL/PLAIN authentication; use an init container or `kafka-topics.sh` entrypoint script to create topics `gps-pings`, `ride-events`, `dispatch-commands`, and `notifications` on first startup
     - Add PostgreSQL container with a non-empty password loaded from `${POSTGRES_PASSWORD}`; define a named volume for data persistence
     - Add Redis container with a non-empty password loaded from `${REDIS_PASSWORD}`; define a named volume for data persistence
     - All credentials referenced via `${VAR_NAME}` substitution — no hardcoded values
@@ -198,7 +198,7 @@ LLD reference: All tasks below reference the exact module structures, design pat
 
   - [ ] 8.2 Define named Docker networks and assign services
     - Define three named networks: `kafka-net`, `db-net`, `frontend-net`
-    - Assign: Redpanda + all services → `kafka-net`; PostgreSQL + Redis + Dispatch Service → `db-net`; Dispatch Service + Rider UI → `frontend-net`
+    - Assign: Kafka broker + all services → `kafka-net`; PostgreSQL + Redis + Dispatch Service → `db-net`; Dispatch Service + Rider UI → `frontend-net`
     - Ingest Service and Notification Service MUST NOT be connected to `db-net`; Rider UI MUST NOT be connected to `kafka-net` or `db-net`
     - _Requirements: 7.8, 10.5_
 
@@ -262,7 +262,7 @@ LLD reference: All tasks below reference the exact module structures, design pat
     - _Requirements: 11.3_
 
   - [ ]* 12.4 Write a property test for the trip_id correlation invariant (Hypothesis)
-    - **Property 10: trip_id correlation across the full pipeline** — generate random valid ride requests; for each, assert that the `trip_id` returned in the HTTP 202 response from `POST /request-ride` equals the `trip_id` in the `TripAssigned` Domain Event logged by the Notification Service. Run against the docker-compose environment with mocked Kafka or a test Redpanda instance.
+    - **Property 10: trip_id correlation across the full pipeline** — generate random valid ride requests; for each, assert that the `trip_id` returned in the HTTP 202 response from `POST /request-ride` equals the `trip_id` in the `TripAssigned` Domain Event logged by the Notification Service. Run against the docker-compose environment with mocked Kafka or a test Kafka (KRaft) instance.
     - Tag with `# Feature: e2e-skeleton, Property 10: trip_id correlation across the full pipeline`
     - _Requirements: 11.2_
 
