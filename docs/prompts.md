@@ -134,3 +134,7 @@ Please keep in mind that I want to keep costs down, especially AWS costs, while 
 ### Strimzi
 
 I'd like to use Strimzi Kafka on EKS  over MSK. Please give your recommendation
+
+## Demo value
+
+Are there any other black boxes that have no demo value?

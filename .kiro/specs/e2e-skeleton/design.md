@@ -104,7 +104,7 @@ All services instrument with OpenTelemetry from Phase 1. Production systems are 
 - **Metrics**: Every service exposes a Prometheus-format `/metrics` endpoint — Kafka consumer lag, HTTP p50/p95/p99 latency, DB query duration, WebSocket connection count.
 - **Logs**: Structured JSON with a `trace_id` field on every log line — logs correlate to traces in Jaeger/Grafana.
 - **Local dev**: Jaeger (`:16686`) for traces, Prometheus (`:9090`) + Grafana (`:3000`) for metrics, all in docker-compose.
-- **Production**: AWS X-Ray (traces) + Amazon Managed Prometheus + Grafana.
+- **Production / Demo on EKS**: Jaeger + Prometheus + Grafana self-hosted on EKS — same images as local dev, runs on existing Spot nodes at no extra AWS cost. AWS X-Ray and Amazon Managed Prometheus are black boxes with no demo value and are not used.
 
 **OTel SDK per language**:
 - Go services: `go.opentelemetry.io/otel` + `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`

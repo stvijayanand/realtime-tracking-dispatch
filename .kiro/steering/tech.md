@@ -72,7 +72,8 @@
 ### Redis — Geospatial driver index, ETA cache, WebSocket session registry
 
 - **Local dev**: `redis:7.2-alpine` (pinned), password-protected
-- **Production**: AWS ElastiCache for Redis (cluster mode enabled, Multi-AZ)
+- **Production / Demo on EKS**: **Self-hosted Redis StatefulSet** on EKS — same `redis:7.2-alpine` image as local dev; `PersistentVolumeClaim` backed by EBS gp3; runs on existing Spot nodes at no extra AWS cost; demonstrates stateful workload management on Kubernetes
+- **Why not ElastiCache**: ElastiCache is a black box with no demo value — you configure it and it runs Redis, but nothing about it is visible or demonstrable. It also costs ~$0.017/hour even at zero load. Self-hosted Redis on EKS is identical to the local docker-compose setup and costs nothing extra.
 - **Geospatial**: `GEOADD dispatch:drivers <lng> <lat> <driver_id>` — Dispatch Service CQRS read model (Phase 2). `GEORADIUS` for nearest-driver queries.
 - **ETA cache**: `SET eta:{trip_id} <seconds> EX 30` — 30-second TTL, refreshed on each `ETAUpdated` event
 - **WebSocket session registry**: `HSET gateway:sessions:{rider_id} instance_id connection_id` — enables multi-instance Gateway fan-out via Redis Pub/Sub. Phase 1 uses in-memory map; Phase 2 uses Redis.
@@ -120,7 +121,7 @@ Production systems are not observable by accident. OTel is instrumented from the
 - **Metrics**: Prometheus-format `/metrics` endpoint on every service — Kafka consumer lag, HTTP p50/p95/p99 latency, DB query duration, WebSocket connection count
 - **Logs**: Structured JSON with `trace_id` field — logs correlate to traces in Jaeger/Grafana
 - **Local dev**: Jaeger (traces) + Prometheus + Grafana in docker-compose
-- **Production**: AWS X-Ray (traces) + Amazon Managed Prometheus + Grafana
+- **Production / Demo on EKS**: Jaeger + Prometheus + Grafana self-hosted on EKS — same images as local dev, runs on existing Spot nodes at no extra AWS cost. AWS X-Ray and Amazon Managed Prometheus are black boxes with no demo value; self-hosted tooling demonstrates you understand OpenTelemetry, PromQL, and distributed tracing tooling directly.
 
 ---
 
@@ -133,17 +134,17 @@ Production systems are not observable by accident. OTel is instrumented from the
 - **AWS EKS** (Elastic Kubernetes Service) — managed Kubernetes, integrates with IAM, ALB Ingress Controller, EBS/EFS volumes
 - **Strimzi Kafka Operator** — runs Apache Kafka natively on EKS via Kubernetes CRDs (`Kafka`, `KafkaTopic`, `KafkaUser`); installed via Helm; same binary as local docker-compose; no separate AWS Kafka billing; cloud-portable
 - **Aurora Serverless v2** — PostgreSQL-compatible; scales to 0 ACUs when idle; cold-start ~1–2s on first query; use provisioned RDS only for sustained production load
-- **ElastiCache `cache.t3.micro`** — torn down with everything else via `terraform destroy`
-- **Spot instances** (`t3.large`) for EKS worker nodes — 60–90% cheaper than On-Demand; sufficient for a demo cluster running 5–6 small pods
+- **Self-hosted Redis StatefulSet** — same `redis:7.2-alpine` image as local dev; EBS gp3 PVC; runs on existing Spot nodes; no ElastiCache billing; demonstrates stateful workload management on Kubernetes
+- **Spot instances** (`t3.large`) for EKS worker nodes — 60–90% cheaper than On-Demand; sufficient for a demo cluster running all services plus Strimzi Kafka
 - **Horizontal Pod Autoscaler (HPA)** on all services — scale on CPU and custom metrics (Kafka consumer lag via KEDA)
 - **KEDA** (Kubernetes Event-Driven Autoscaling) — scales Kafka consumer pods based on consumer group lag
 - **AWS ALB Ingress Controller** — TLS termination, path-based routing, WAF integration
 
 ### Cost Strategy: Spin-Up / Tear-Down
 - **Zero cost when idle** — `make demo-down` runs `terraform destroy` and stops all AWS billing
-- **~$0.50–1.50 per 4-hour demo session** — EKS Spot + Aurora Serverless v2 + ElastiCache (Strimzi removes the MSK billing line entirely)
+- **~$0.30–0.80 per 4-hour demo session** — EKS Spot + Aurora Serverless v2 only (Strimzi, Redis, Jaeger, Prometheus, Grafana all run on existing Spot nodes at no extra cost)
 - **Dead-man's switch** — a scheduled Lambda auto-destroys the environment after 6 hours without a heartbeat, preventing forgotten idle resources
-- **Self-hosted on EKS** (no extra AWS cost): Strimzi Kafka, HashiCorp Vault, Schema Registry, Jaeger, Prometheus, Grafana, PgBouncer
+- **Self-hosted on EKS** (no extra AWS cost): Strimzi Kafka, self-hosted Redis, HashiCorp Vault, Schema Registry, Jaeger, Prometheus, Grafana, PgBouncer
 - See `docs/adr/007-demo-infrastructure-cost-strategy.md` for full cost breakdown and Terraform module structure
 
 ### Container Standards
@@ -227,8 +228,8 @@ open http://localhost:16686  # Jaeger UI
 open http://localhost:3000   # Grafana (admin/admin)
 
 # ── Demo infrastructure (AWS) ──────────────────────────────────────────────
-# Spin up full AWS demo environment (~10 min; ~$0.50–1.50 per 4-hour session)
-make demo-up             # terraform apply — EKS + Strimzi Kafka + Aurora Serverless v2 + ElastiCache
+# Spin up full AWS demo environment (~12 min; ~$0.30–0.80 per 4-hour session)
+make demo-up             # terraform apply — EKS + Strimzi Kafka + Aurora Serverless v2 (Redis/Jaeger/Prometheus self-hosted on EKS)
 
 # Tear down all AWS resources (billing stops immediately)
 make demo-down           # terraform destroy — run this when demo is finished

@@ -12,7 +12,7 @@
 This platform is built to FAANG-scale production standards and deployed on AWS EKS. However, it is also a demonstration system — it does not serve real users and should not incur AWS costs when not actively being shown. The goal is to make no concessions on technology choices while paying as close to zero as possible when the demo is idle.
 
 Two constraints must be satisfied simultaneously:
-1. **Technology fidelity**: The AWS deployment must use production-grade technology — EKS, Kubernetes-native Kafka, RDS, ElastiCache — not toy substitutes.
+1. **Technology fidelity**: The AWS deployment must use production-grade technology — EKS, Kubernetes-native Kafka, PostgreSQL, Redis — not toy substitutes or managed black boxes with no demo value.
 2. **Cost discipline**: AWS billing stops completely when the demo is not running. No idle resources, no forgotten instances.
 
 ---
@@ -26,7 +26,7 @@ The system runs in two modes:
 | Mode | Environment | Cost |
 |---|---|---|
 | **Development / CI** | `docker-compose up` on a laptop | $0 |
-| **Demo** | AWS EKS via `make demo-up` | ~$0.50–1.50 per 4-hour session |
+| **Demo** | AWS EKS via `make demo-up` | ~$0.30–0.80 per 4-hour session |
 
 All development, testing, and iteration happens locally. AWS is only provisioned for live demos and torn down immediately after.
 
@@ -134,21 +134,45 @@ The `KAFKA_BOOTSTRAP_SERVERS` env var points to `dispatch-cluster-kafka-bootstra
 - Minimum ACU capacity: 0.5 (scales up on first query, scales back to 0 after idle timeout)
 - **Why not RDS `db.t3.micro`**: A stopped RDS instance still charges for storage and cannot be destroyed/recreated quickly. Aurora Serverless v2 scales to near-zero automatically without manual stop/start.
 
-#### ElastiCache (Redis)
-- `cache.t3.micro` — ~$0.017/hour
-- Tear down with everything else via `terraform destroy`
-- Phase 1 Redis is reserved but not written to; Phase 2 activates GEOADD
+#### Redis: Self-Hosted StatefulSet on EKS (not ElastiCache)
+
+Redis runs as a Kubernetes `StatefulSet` with an EBS gp3 `PersistentVolumeClaim` — the same `redis:7.2-alpine` image as local docker-compose.
+
+**Why not ElastiCache:**
+
+| Dimension | Self-hosted Redis StatefulSet | ElastiCache |
+|---|---|---|
+| Cost | $0 Redis billing — runs on existing Spot nodes; ~$0.08/GB-month EBS only | ~$0.017/hour even at zero load |
+| Demo value | Shows stateful workload management on Kubernetes (StatefulSet, PVC, headless Service) | Black box — nothing to demonstrate |
+| Consistency | Same `redis:7.2-alpine` image as local docker-compose | Different runtime |
+| Cloud portability | Works on any Kubernetes cluster | AWS-only |
+
+#### Observability: Self-Hosted on EKS (not AWS X-Ray / Amazon Managed Prometheus)
+
+Jaeger, Prometheus, and Grafana run as Kubernetes pods on EKS — the same images as local docker-compose. AWS X-Ray and Amazon Managed Prometheus are black boxes with no demo value: you send data to them and they display it, but nothing about them is visible or demonstrable.
+
+Self-hosted observability on EKS demonstrates:
+- You understand OpenTelemetry SDK instrumentation (not just "we used X-Ray")
+- You can write PromQL queries and build Grafana dashboards
+- You understand distributed tracing across async Kafka boundaries
+
+Cost: $0 extra — runs on existing Spot nodes.
+
+#### ElastiCache → Removed
+
+ElastiCache is removed from the stack. Redis runs self-hosted (see above).
 
 #### Self-Hosted on EKS (no additional AWS cost)
 The following run as Kubernetes pods on the EKS cluster — no separate managed service:
 - **Strimzi Kafka** (3-broker KRaft cluster)
+- **Redis** (`redis:7.2-alpine` StatefulSet with EBS gp3 PVC)
 - **HashiCorp Vault** (`vault:1.15`)
 - **Confluent Schema Registry** (self-hosted)
-- **Jaeger** (traces)
-- **Prometheus + Grafana** (metrics)
+- **Jaeger** (traces — replaces AWS X-Ray)
+- **Prometheus + Grafana** (metrics — replaces Amazon Managed Prometheus)
 - **PgBouncer** (connection pooling)
 
-All of these are destroyed with the cluster at no extra cost.
+All of these are destroyed with the cluster at no extra cost. The only AWS-managed services remaining are EKS (control plane) and Aurora Serverless v2 (PostgreSQL).
 
 ### Dead-Man's Switch: Auto-Destroy Lambda
 
@@ -163,12 +187,12 @@ The Lambda is defined in `infra/terraform/modules/auto-destroy/` and is deployed
 | Scenario | Duration | Estimated cost |
 |---|---|---|
 | Local docker-compose | Unlimited | $0 |
-| AWS demo session | 4 hours | ~$0.50–1.50 |
-| AWS demo session | 8 hours | ~$1.50–3.00 |
-| Auto-destroy fires (forgotten demo) | 6 hours max | ~$1.00–2.00 |
-| AWS resources left running 1 week | 168 hours | ~$30–50 (prevented by auto-destroy) |
+| AWS demo session | 4 hours | ~$0.30–0.80 |
+| AWS demo session | 8 hours | ~$0.80–1.60 |
+| Auto-destroy fires (forgotten demo) | 6 hours max | ~$0.50–1.20 |
+| AWS resources left running 1 week | 168 hours | ~$15–25 (prevented by auto-destroy) |
 
-Cost reduction vs. MSK Serverless: removing the MSK billing line saves ~$0.50–1.00 per session at demo traffic levels.
+The only billable AWS services are: EKS control plane ($0.10/hour) + EKS Spot nodes (~$0.05–0.10/hour for 2× `t3.large` Spot) + Aurora Serverless v2 (near-zero when idle) + ECR storage (negligible). Everything else runs on the Spot nodes at no extra cost.
 
 ### Terraform Module Structure
 
@@ -181,7 +205,6 @@ infra/terraform/
     eks/                     — EKS cluster + Spot node group
     strimzi/                 — Helm release for Strimzi operator
     rds/                     — Aurora Serverless v2 PostgreSQL cluster
-    elasticache/             — Redis cache.t3.micro
     ecr/                     — ECR repositories for all service images
     auto-destroy/            — Lambda + EventBridge rule for dead-man's switch
   environments/
@@ -192,6 +215,13 @@ infra/k8s/
     kafka-cluster.yaml       — Kafka CRD (3-broker KRaft, SCRAM-SHA-512)
     topics/                  — KafkaTopic CRDs for all topics
     users/                   — KafkaUser CRDs with per-service ACLs
+  redis/
+    statefulset.yaml         — Redis StatefulSet with EBS gp3 PVC
+    service.yaml             — Headless Service for Redis
+  observability/
+    jaeger.yaml              — Jaeger all-in-one Deployment + Service
+    prometheus.yaml          — Prometheus Deployment + ConfigMap (scrape configs)
+    grafana.yaml             — Grafana Deployment + ConfigMap (data sources)
 ```
 
 ### Makefile Targets
@@ -223,23 +253,27 @@ check-openapi: scripts/generate_openapi.sh && git diff --exit-code services/*/op
 ### Positive
 - Zero AWS cost when demo is not running
 - Strimzi removes the MSK billing line entirely — Kafka runs on existing Spot nodes at no extra cost
-- Demonstrates Kubernetes-native Kafka operations (CRDs, operator pattern) — higher demo value than a managed black box
-- Identical Apache Kafka binary in local docker-compose and on EKS — no environment drift
-- Cloud-portable: the same Strimzi manifests work on GKE, AKS, or bare-metal Kubernetes
+- Self-hosted Redis removes the ElastiCache billing line — Redis runs on existing Spot nodes at no extra cost
+- Self-hosted Jaeger + Prometheus + Grafana removes AWS X-Ray and Amazon Managed Prometheus — observability runs on existing Spot nodes at no extra cost
+- Only two AWS-managed services remain: EKS control plane and Aurora Serverless v2
+- Demonstrates Kubernetes-native operations across the full stack: Strimzi CRDs, Redis StatefulSet, Jaeger/Prometheus/Grafana deployments — higher demo value than managed black boxes
+- Identical images and configuration between local docker-compose and EKS — no environment drift
+- Cloud-portable: the same Kubernetes manifests work on GKE, AKS, or bare-metal
 - Single command to create and destroy the full environment
 - Auto-destroy Lambda prevents forgotten idle resources
 - Aurora Serverless v2 scales to near-zero automatically, providing a second layer of cost protection
 
 ### Negative / Trade-offs
 - `make demo-up` takes ~12–15 minutes (EKS cluster creation + Strimzi operator + Kafka cluster bootstrap)
-- Strimzi requires more EKS node capacity than MSK (Kafka brokers run as pods); 2 `t3.large` Spot nodes instead of 1
-- You own broker health — if a broker pod crashes, the Strimzi operator restarts it, but you need to understand why; MSK would handle this transparently
+- Strimzi + Redis StatefulSet + observability stack requires 2 `t3.large` Spot nodes instead of 1
+- You own broker health and Redis persistence — the Strimzi operator and Kubernetes handle restarts, but you need to understand failure modes; managed services would handle this transparently
 - Aurora Serverless v2 has a cold-start latency (~1–2 seconds) on the first query after scaling to zero — acceptable for a demo
 - Terraform state must be stored remotely (S3 + DynamoDB lock table) to support the auto-destroy Lambda; this adds a small S3 cost (~$0.023/GB-month, negligible)
 
 ### Neutral
 - The docker-compose environment and the EKS environment use identical container images and identical Kafka configuration — the same `make build` produces images that run in both
 - `KAFKA_BOOTSTRAP_SERVERS` changes from an MSK endpoint to `dispatch-cluster-kafka-bootstrap:9092` (Strimzi Kubernetes Service) — a one-line env var change
+- `REDIS_HOST` changes from an ElastiCache endpoint to `redis:6379` (Kubernetes Service) — identical to local docker-compose
 - Kubernetes manifests in `infra/k8s/` are environment-agnostic; only the Terraform variables change between local and demo
 
 ---
@@ -253,3 +287,5 @@ check-openapi: scripts/generate_openapi.sh && git diff --exit-code services/*/op
 - [EKS Spot instances](https://docs.aws.amazon.com/eks/latest/userguide/managed-node-groups.html)
 - [Terraform AWS provider](https://registry.terraform.io/providers/hashicorp/aws/latest/docs)
 - [HashiCorp Vault on Kubernetes](https://developer.hashicorp.com/vault/docs/platform/k8s)
+- [Jaeger on Kubernetes](https://www.jaegertracing.io/docs/latest/operator/)
+- [KEDA Kafka scaler](https://keda.sh/docs/latest/scalers/apache-kafka/)
