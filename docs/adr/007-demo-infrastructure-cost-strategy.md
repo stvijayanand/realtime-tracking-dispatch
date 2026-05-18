@@ -12,7 +12,7 @@
 This platform is built to FAANG-scale production standards and deployed on AWS EKS. However, it is also a demonstration system — it does not serve real users and should not incur AWS costs when not actively being shown. The goal is to make no concessions on technology choices while paying as close to zero as possible when the demo is idle.
 
 Two constraints must be satisfied simultaneously:
-1. **Technology fidelity**: The AWS deployment must use the same services a production system would — EKS, MSK, RDS, ElastiCache — not toy substitutes.
+1. **Technology fidelity**: The AWS deployment must use production-grade technology — EKS, Kubernetes-native Kafka, RDS, ElastiCache — not toy substitutes.
 2. **Cost discipline**: AWS billing stops completely when the demo is not running. No idle resources, no forgotten instances.
 
 ---
@@ -26,7 +26,7 @@ The system runs in two modes:
 | Mode | Environment | Cost |
 |---|---|---|
 | **Development / CI** | `docker-compose up` on a laptop | $0 |
-| **Demo** | AWS EKS via `make demo-up` | ~$1–2 per 4-hour session |
+| **Demo** | AWS EKS via `make demo-up` | ~$0.50–1.50 per 4-hour session |
 
 All development, testing, and iteration happens locally. AWS is only provisioned for live demos and torn down immediately after.
 
@@ -46,15 +46,87 @@ The Terraform state is the source of truth. If `terraform show` lists resources,
 #### EKS (Kubernetes)
 - Control plane: `$0.10/hour` — unavoidable while cluster exists
 - Worker nodes: **Spot instances** (`t3.large`) — 60–90% cheaper than On-Demand
-- For a demo cluster running 5–6 small Go/Java pods, one `t3.large` Spot node is sufficient
+- For a demo cluster running all services plus Strimzi Kafka, 2 `t3.large` Spot nodes are sufficient
 - Node group uses `capacity_type = "SPOT"` in Terraform
 
-#### MSK (Managed Kafka)
-- Use **MSK Serverless** — charges per partition-hour and per GB transferred
-- For a demo with low traffic, cost is near zero
-- Provides the real MSK API, real KRaft mode, real SASL/PLAIN — identical to a production MSK cluster
-- No broker sizing decisions; MSK Serverless scales automatically
-- **Why not a provisioned 3-broker cluster**: A `kafka.t3.small` 3-broker cluster costs ~$0.27/hour even at zero load. MSK Serverless costs effectively nothing at demo traffic levels.
+#### Kafka: Strimzi Operator on EKS (not MSK)
+
+Kafka runs on EKS via the **Strimzi Kafka Operator** — no separate AWS Kafka billing line.
+
+**Why Strimzi over MSK Serverless:**
+
+| Dimension | Strimzi on EKS | MSK Serverless |
+|---|---|---|
+| Cost | $0 Kafka billing — runs on existing Spot nodes | Per partition-hour + per GB transferred |
+| Demo value | Shows Kubernetes-native Kafka operations (CRDs, operator) | Black box — nothing to demonstrate |
+| Consistency | Same Apache Kafka binary as local docker-compose | Different runtime, different edge behaviour |
+| Cloud portability | Works on EKS, GKE, AKS, bare metal | AWS-only |
+| KRaft support | Full KRaft via `process.roles: broker,controller` | Internal KRaft, not configurable |
+
+Strimzi is installed via Helm (`strimzi/strimzi-kafka-operator`). The Kafka cluster, topics, and per-service users are all Kubernetes CRDs:
+
+```yaml
+# infra/k8s/kafka/kafka-cluster.yaml
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: dispatch-cluster
+spec:
+  kafka:
+    version: 3.7.0
+    replicas: 3
+    config:
+      process.roles: broker,controller
+      min.insync.replicas: 2
+    storage:
+      type: persistent-claim
+      size: 50Gi
+      class: gp3
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+        authentication:
+          type: scram-sha-512
+```
+
+```yaml
+# infra/k8s/kafka/topics/gps-pings.yaml
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: gps-pings
+  labels:
+    strimzi.io/cluster: dispatch-cluster
+spec:
+  partitions: 12
+  replicas: 3
+  config:
+    min.insync.replicas: "2"
+```
+
+```yaml
+# infra/k8s/kafka/users/ingest-service.yaml
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: ingest-service
+  labels:
+    strimzi.io/cluster: dispatch-cluster
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: gps-pings
+        operation: Write
+```
+
+The `KAFKA_BOOTSTRAP_SERVERS` env var points to `dispatch-cluster-kafka-bootstrap:9092` — the Strimzi-managed Kubernetes Service. This is the only change from the local docker-compose config.
 
 #### RDS PostgreSQL
 - Use **Aurora Serverless v2** (`db.serverless`, PostgreSQL-compatible)
@@ -69,13 +141,14 @@ The Terraform state is the source of truth. If `terraform show` lists resources,
 
 #### Self-Hosted on EKS (no additional AWS cost)
 The following run as Kubernetes pods on the EKS cluster — no separate managed service:
-- HashiCorp Vault (self-hosted, `vault:1.15`)
-- Confluent Schema Registry (self-hosted)
-- Jaeger (traces)
-- Prometheus + Grafana (metrics)
-- PgBouncer (connection pooling)
+- **Strimzi Kafka** (3-broker KRaft cluster)
+- **HashiCorp Vault** (`vault:1.15`)
+- **Confluent Schema Registry** (self-hosted)
+- **Jaeger** (traces)
+- **Prometheus + Grafana** (metrics)
+- **PgBouncer** (connection pooling)
 
-This is intentional: these components are production-grade but do not require managed AWS services. Running them on EKS means they are destroyed with the cluster at no extra cost.
+All of these are destroyed with the cluster at no extra cost.
 
 ### Dead-Man's Switch: Auto-Destroy Lambda
 
@@ -90,10 +163,12 @@ The Lambda is defined in `infra/terraform/modules/auto-destroy/` and is deployed
 | Scenario | Duration | Estimated cost |
 |---|---|---|
 | Local docker-compose | Unlimited | $0 |
-| AWS demo session | 4 hours | ~$1–2 |
-| AWS demo session | 8 hours | ~$3–5 |
-| Auto-destroy fires (forgotten demo) | 6 hours max | ~$2–3 |
-| AWS resources left running 1 week | 168 hours | ~$50–80 (prevented by auto-destroy) |
+| AWS demo session | 4 hours | ~$0.50–1.50 |
+| AWS demo session | 8 hours | ~$1.50–3.00 |
+| Auto-destroy fires (forgotten demo) | 6 hours max | ~$1.00–2.00 |
+| AWS resources left running 1 week | 168 hours | ~$30–50 (prevented by auto-destroy) |
+
+Cost reduction vs. MSK Serverless: removing the MSK billing line saves ~$0.50–1.00 per session at demo traffic levels.
 
 ### Terraform Module Structure
 
@@ -101,16 +176,22 @@ The Lambda is defined in `infra/terraform/modules/auto-destroy/` and is deployed
 infra/terraform/
   main.tf                    — root module, calls all child modules
   variables.tf               — input variables (region, cluster name, tags)
-  outputs.tf                 — kubeconfig, MSK bootstrap servers, RDS endpoint
+  outputs.tf                 — kubeconfig, Kafka bootstrap service, RDS endpoint
   modules/
     eks/                     — EKS cluster + Spot node group
-    msk/                     — MSK Serverless cluster + SASL/PLAIN credentials
+    strimzi/                 — Helm release for Strimzi operator
     rds/                     — Aurora Serverless v2 PostgreSQL cluster
     elasticache/             — Redis cache.t3.micro
     ecr/                     — ECR repositories for all service images
     auto-destroy/            — Lambda + EventBridge rule for dead-man's switch
   environments/
     demo/                    — demo-specific tfvars (minimal sizing, Spot instances)
+
+infra/k8s/
+  kafka/
+    kafka-cluster.yaml       — Kafka CRD (3-broker KRaft, SCRAM-SHA-512)
+    topics/                  — KafkaTopic CRDs for all topics
+    users/                   — KafkaUser CRDs with per-service ACLs
 ```
 
 ### Makefile Targets
@@ -128,7 +209,7 @@ lint:         golangci-lint run + mvn checkstyle:check
 demo-up:      cd infra/terraform && terraform init && terraform apply -auto-approve -var-file=environments/demo/demo.tfvars
 demo-down:    cd infra/terraform && terraform destroy -auto-approve -var-file=environments/demo/demo.tfvars
 demo-status:  cd infra/terraform && terraform show | grep -E "resource|id ="
-demo-extend:  aws lambda invoke --function-name demo-heartbeat /dev/null  # resets auto-destroy timer
+demo-extend:  aws lambda invoke --function-name dispatch-demo-heartbeat /dev/null
 demo-cost:    cd infra/terraform && terraform plan -var-file=environments/demo/demo.tfvars | grep -c "will be created"
 
 # OpenAPI
@@ -141,26 +222,33 @@ check-openapi: scripts/generate_openapi.sh && git diff --exit-code services/*/op
 
 ### Positive
 - Zero AWS cost when demo is not running
-- No concessions on technology — EKS, MSK, RDS, ElastiCache are the same services used in production
+- Strimzi removes the MSK billing line entirely — Kafka runs on existing Spot nodes at no extra cost
+- Demonstrates Kubernetes-native Kafka operations (CRDs, operator pattern) — higher demo value than a managed black box
+- Identical Apache Kafka binary in local docker-compose and on EKS — no environment drift
+- Cloud-portable: the same Strimzi manifests work on GKE, AKS, or bare-metal Kubernetes
 - Single command to create and destroy the full environment
 - Auto-destroy Lambda prevents forgotten idle resources
-- Aurora Serverless v2 and MSK Serverless scale to near-zero automatically, providing a second layer of cost protection even if `make demo-down` is not run immediately
+- Aurora Serverless v2 scales to near-zero automatically, providing a second layer of cost protection
 
 ### Negative / Trade-offs
-- `make demo-up` takes ~10 minutes (EKS cluster creation is the bottleneck)
-- MSK Serverless has slightly higher per-message latency than a provisioned cluster at high throughput — acceptable for a demo, not for production
+- `make demo-up` takes ~12–15 minutes (EKS cluster creation + Strimzi operator + Kafka cluster bootstrap)
+- Strimzi requires more EKS node capacity than MSK (Kafka brokers run as pods); 2 `t3.large` Spot nodes instead of 1
+- You own broker health — if a broker pod crashes, the Strimzi operator restarts it, but you need to understand why; MSK would handle this transparently
 - Aurora Serverless v2 has a cold-start latency (~1–2 seconds) on the first query after scaling to zero — acceptable for a demo
 - Terraform state must be stored remotely (S3 + DynamoDB lock table) to support the auto-destroy Lambda; this adds a small S3 cost (~$0.023/GB-month, negligible)
 
 ### Neutral
-- The docker-compose environment and the AWS environment use identical container images — the same `make build` produces images that run in both
+- The docker-compose environment and the EKS environment use identical container images and identical Kafka configuration — the same `make build` produces images that run in both
+- `KAFKA_BOOTSTRAP_SERVERS` changes from an MSK endpoint to `dispatch-cluster-kafka-bootstrap:9092` (Strimzi Kubernetes Service) — a one-line env var change
 - Kubernetes manifests in `infra/k8s/` are environment-agnostic; only the Terraform variables change between local and demo
 
 ---
 
 ## References
 
-- [MSK Serverless pricing](https://aws.amazon.com/msk/pricing/)
+- [Strimzi Kafka Operator](https://strimzi.io/)
+- [Strimzi KRaft support](https://strimzi.io/blog/2023/09/11/kafka-kraft-migration/)
+- [Strimzi Helm chart](https://artifacthub.io/packages/helm/strimzi/strimzi-kafka-operator)
 - [Aurora Serverless v2 pricing](https://aws.amazon.com/rds/aurora/pricing/)
 - [EKS Spot instances](https://docs.aws.amazon.com/eks/latest/userguide/managed-node-groups.html)
 - [Terraform AWS provider](https://registry.terraform.io/providers/hashicorp/aws/latest/docs)

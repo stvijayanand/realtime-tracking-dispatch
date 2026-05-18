@@ -130,3 +130,7 @@ I see a section for Observability, but I still see stdout in requirements. Pleas
 ## AWS cost
 
 Please keep in mind that I want to keep costs down, especially AWS costs, while making no concessions on the right technology choice for a FAANG scale distributed system. I would like to spin up this demo only when needed to save costs. Any guidance please?
+ 
+### Strimzi
+
+I'd like to use Strimzi Kafka on EKS  over MSK. Please give your recommendation

@@ -19,8 +19,9 @@ realtime-tracking-dispatch/
 ├── infra/                     # Infrastructure-as-code
 │   ├── docker/                # Dockerfiles per service (multi-stage, distroless for Go)
 │   ├── k8s/                   # Kubernetes manifests (Deployments, Services, HPAs, KEDA ScaledObjects)
+│   │   └── kafka/             # Strimzi CRDs: Kafka cluster, KafkaTopic, KafkaUser (per-service ACLs)
 │   ├── kafka/                 # Topic configs, Schema Registry config, ACL definitions
-│   └── terraform/             # AWS infrastructure (EKS, MSK, RDS, ElastiCache, DynamoDB)
+│   └── terraform/             # AWS infrastructure (EKS, Aurora Serverless v2, ElastiCache, ECR, auto-destroy Lambda)
 ├── scripts/                   # Dev/ops helper scripts
 ├── docs/                      # Architecture diagrams, ADRs
 │   ├── adr/                   # Architecture Decision Records (NNN-title.md)

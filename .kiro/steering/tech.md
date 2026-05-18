@@ -23,10 +23,29 @@
 ### Apache Kafka (KRaft mode) — Primary event bus
 
 - **Local dev**: 3-broker KRaft cluster in docker-compose (`confluentinc/cp-kafka:7.6.1`), no ZooKeeper
-- **Production**: AWS MSK (Managed Streaming for Kafka) — fully managed, multi-AZ, KRaft-native from MSK 2.x
+- **Production / Demo on EKS**: **Strimzi Kafka Operator** — runs Apache Kafka natively on Kubernetes via `Kafka`, `KafkaTopic`, and `KafkaUser` CRDs; installed via Helm chart (`strimzi/strimzi-kafka-operator`); same Apache Kafka binary as local dev; cloud-agnostic (works on EKS, GKE, AKS, bare metal)
+- **Why Strimzi over MSK**: Runs on the same EKS Spot nodes already paid for — no separate Kafka billing line. Demonstrates Kubernetes-native Kafka operations (CRDs, operator pattern) rather than a managed black box. Identical config to local docker-compose. Cloud-portable.
 - **Replication**: `replication.factor=3`, `min.insync.replicas=2` on all topics — demonstrates fault tolerance
 - **Producer config**: `acks=all`, `enable.idempotence=true` on every producer
 - **Schema enforcement**: Confluent Schema Registry + **Avro** for all Domain Events — schema evolution with backward/forward compatibility enforced at publish time; broker rejects malformed messages before they reach consumers
+- **KRaft config via Strimzi CRD**:
+  ```yaml
+  apiVersion: kafka.strimzi.io/v1beta2
+  kind: Kafka
+  metadata:
+    name: dispatch-cluster
+  spec:
+    kafka:
+      version: 3.7.0
+      replicas: 3
+      config:
+        process.roles: broker,controller
+        min.insync.replicas: 2
+      storage:
+        type: persistent-claim
+        size: 50Gi
+        class: gp3
+  ```
 - Topics: `gps-pings`, `ride-events`, `dispatch-commands`, `notifications`
 
 ### AWS Kinesis — Analytics / GPS history pipeline (Phase 2)
@@ -112,7 +131,7 @@ Production systems are not observable by accident. OTel is instrumented from the
 
 ### Production / Demo on AWS
 - **AWS EKS** (Elastic Kubernetes Service) — managed Kubernetes, integrates with IAM, ALB Ingress Controller, EBS/EFS volumes
-- **MSK Serverless** — Kafka with no broker sizing; scales to near-zero at demo traffic levels; same API as provisioned MSK; use provisioned `kafka.t3.small` 3-broker cluster only for sustained production load
+- **Strimzi Kafka Operator** — runs Apache Kafka natively on EKS via Kubernetes CRDs (`Kafka`, `KafkaTopic`, `KafkaUser`); installed via Helm; same binary as local docker-compose; no separate AWS Kafka billing; cloud-portable
 - **Aurora Serverless v2** — PostgreSQL-compatible; scales to 0 ACUs when idle; cold-start ~1–2s on first query; use provisioned RDS only for sustained production load
 - **ElastiCache `cache.t3.micro`** — torn down with everything else via `terraform destroy`
 - **Spot instances** (`t3.large`) for EKS worker nodes — 60–90% cheaper than On-Demand; sufficient for a demo cluster running 5–6 small pods
@@ -122,9 +141,9 @@ Production systems are not observable by accident. OTel is instrumented from the
 
 ### Cost Strategy: Spin-Up / Tear-Down
 - **Zero cost when idle** — `make demo-down` runs `terraform destroy` and stops all AWS billing
-- **~$1–2 per 4-hour demo session** — EKS Spot + MSK Serverless + Aurora Serverless v2 + ElastiCache
+- **~$0.50–1.50 per 4-hour demo session** — EKS Spot + Aurora Serverless v2 + ElastiCache (Strimzi removes the MSK billing line entirely)
 - **Dead-man's switch** — a scheduled Lambda auto-destroys the environment after 6 hours without a heartbeat, preventing forgotten idle resources
-- **Self-hosted on EKS** (no extra AWS cost): HashiCorp Vault, Schema Registry, Jaeger, Prometheus, Grafana, PgBouncer
+- **Self-hosted on EKS** (no extra AWS cost): Strimzi Kafka, HashiCorp Vault, Schema Registry, Jaeger, Prometheus, Grafana, PgBouncer
 - See `docs/adr/007-demo-infrastructure-cost-strategy.md` for full cost breakdown and Terraform module structure
 
 ### Container Standards
@@ -172,7 +191,7 @@ Production systems are not observable by accident. OTel is instrumented from the
 - All Dockerfiles run as non-root users with pinned base image versions
 - All HTTP endpoints enforce 64 KB maximum request body size
 - Services fail fast with a descriptive error if a required environment variable is missing
-- Phase 2: mTLS between services and Kafka (MSK TLS listener); JWT auth at Gateway; rate limiting via Kong/ALB WAF
+- Phase 2: mTLS between services and Kafka (Strimzi TLS listener); JWT auth at Gateway; rate limiting via Kong/ALB WAF
 - See `docs/adr/004-security-model.md` for the full security model and phase controls
 
 ## Common Commands
@@ -208,8 +227,8 @@ open http://localhost:16686  # Jaeger UI
 open http://localhost:3000   # Grafana (admin/admin)
 
 # ── Demo infrastructure (AWS) ──────────────────────────────────────────────
-# Spin up full AWS demo environment (~10 min; ~$1–2 per 4-hour session)
-make demo-up             # terraform apply — EKS + MSK Serverless + Aurora Serverless v2 + ElastiCache
+# Spin up full AWS demo environment (~10 min; ~$0.50–1.50 per 4-hour session)
+make demo-up             # terraform apply — EKS + Strimzi Kafka + Aurora Serverless v2 + ElastiCache
 
 # Tear down all AWS resources (billing stops immediately)
 make demo-down           # terraform destroy — run this when demo is finished
