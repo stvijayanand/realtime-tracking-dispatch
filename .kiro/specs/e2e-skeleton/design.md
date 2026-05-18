@@ -8,16 +8,16 @@ The pipeline is:
 
 ```
 Driver GPS Ping → POST /location (Ingest Service)
-  → LocationPingReceived event → gps-pings topic (Kafka KRaft)
+  → LocationPingReceived Avro event → gps-pings topic (Kafka KRaft, 3-broker)
     → [Dispatch Service consumes gps-pings — stub, logs only]
     → [Tracking Service — deferred to Phase 2]
 
 Rider Request → POST /request-ride (Dispatch Service)
-  → TripRequested event → ride-events topic
+  → TripRequested Avro event → ride-events topic
     → [Dispatch Service self-consumes TripRequested]
       → hardcoded nearest-driver selection
-      → Trip persisted to PostgreSQL (status: REQUESTED → ASSIGNED)
-      → TripAssigned event → ride-events topic
+      → Trip persisted to PostgreSQL via PgBouncer (status: REQUESTED → ASSIGNED)
+      → TripAssigned Avro event → ride-events topic
         → Notification Service consumes TripAssigned
           → structured JSON log to stdout
 ```
@@ -28,8 +28,10 @@ This skeleton deliberately avoids Kubernetes, Flink, real push notification prov
 
 - **Choreography-based saga (Phase 1)**: The 3-step saga (`TripRequested → TripAssigned → NotificationDispatched`) is simple enough for implicit choreography. No saga orchestrator is needed yet (see ADR 006).
 - **CQRS local read model stub**: The Dispatch Service consumes `gps-pings` via a dedicated consumer group (`dispatch-location-group`) but does not yet write to Redis. This stubs the CQRS projection established in ADR 005 so Phase 2 can add the `GEOADD` logic without architectural change.
-- **Eventual consistency accepted**: The dual-write problem in `POST /request-ride` (Kafka publish + HTTP 202) is accepted in Phase 1. The Trip record is written to PostgreSQL before the HTTP response is returned, so the `trip_id` is always backed by a DB record. The Outbox Pattern is deferred to Phase 2 (see ADR 002).
-- **Idempotent producers, deferred consumer dedup**: All Kafka producers use `enable.idempotence=true`. Consumer-side deduplication via a `processed_events` table is deferred to Phase 2 (see ADR 003).
+- **Eventual consistency accepted**: The dual-write problem in `POST /request-ride` (Kafka publish + HTTP 202) is accepted in Phase 1. The Trip record is written to PostgreSQL (via PgBouncer) before the HTTP response is returned, so the `trip_id` is always backed by a DB record. The Outbox Pattern is deferred to Phase 2 (see ADR 002).
+- **Idempotent producers, deferred consumer dedup**: All Kafka producers use `acks=all` and `enable.idempotence=true`. Consumer-side deduplication via a DynamoDB `processed_events` table is deferred to Phase 2 (see ADR 003).
+- **Avro serialisation from Phase 1**: All Domain Events are serialised as Avro using Confluent Schema Registry. Schemas live in `shared/avro/`. The broker rejects messages that violate the registered schema — malformed events never reach consumers.
+- **Gateway as Kafka consumer**: The Gateway Service is a Kafka consumer (`gateway-consumer-group`) — Kafka fans out events to it. Its sole job is protocol translation: Kafka Domain Event → WebSocket frame pushed to the connected rider. It does not fan out events.
 
 ---
 
@@ -45,45 +47,79 @@ graph TD
     end
 
     subgraph compose["docker-compose (kafka-net)"]
-        INGEST["Ingest Service\nFastAPI :8001\nPOST /location"]
+        INGEST["Ingest Service\nGo :8001\nPOST /location"]
         DISPATCH["Dispatch Service\nSpring Boot :8080\nPOST /request-ride"]
-        NOTIF["Notification Service\nFastAPI :8002\nGET /health"]
-        RP["Apache Kafka (KRaft)\n:9092 SASL/PLAIN"]
+        NOTIF["Notification Service\nGo :8002\nGET /health"]
+        GATEWAY["Gateway Service\nGo :8003\nWebSocket /ws"]
+        RP["Apache Kafka (KRaft, 3-broker)\n:9092 SASL/PLAIN"]
+        SR["Schema Registry\n:8081"]
     end
 
     subgraph dbnet["docker-compose (db-net)"]
         PG["PostgreSQL\ntrips table"]
+        PGB["PgBouncer\n:5432 (transaction pooling)"]
         REDIS["Redis\n(Phase 2: GEOADD)"]
+        DDB["DynamoDB Local\n(Phase 2: dedup)"]
+    end
+
+    subgraph obsnet["docker-compose (observability)"]
+        JAEGER["Jaeger\n:16686"]
+        PROM["Prometheus\n:9090"]
+        GRAFANA["Grafana\n:3000"]
     end
 
     SIM -->|"POST /location"| INGEST
     UI -->|"POST /request-ride"| DISPATCH
-    INGEST -->|"LocationPingReceived\ngps-pings topic"| RP
+    UI -->|"WebSocket /ws"| GATEWAY
+    INGEST -->|"LocationPingReceived\nAvro → gps-pings topic"| RP
+    INGEST -->|"register schema"| SR
     RP -->|"gps-pings\ndispatch-location-group"| DISPATCH
-    DISPATCH -->|"TripRequested\nride-events topic"| RP
+    DISPATCH -->|"TripRequested / TripAssigned\nAvro → ride-events topic"| RP
+    DISPATCH -->|"register schema"| SR
     RP -->|"ride-events\ndispatch-consumer-group"| DISPATCH
-    DISPATCH -->|"TripAssigned\nride-events topic"| RP
     RP -->|"ride-events\nnotification-consumer-group"| NOTIF
-    DISPATCH -->|"INSERT/UPDATE trips"| PG
+    RP -->|"ride-events\ngateway-consumer-group"| GATEWAY
+    DISPATCH -->|"INSERT/UPDATE trips"| PGB
+    PGB -->|"pooled connections"| PG
+    GATEWAY -->|"WebSocket push"| UI
     NOTIF -->|"stdout JSON log"| NOTIF
 ```
 
 ### Network Segmentation
 
 ```
-kafka-net:    kafka, ingest-service, dispatch-service, notification-service
-db-net:       postgres, redis, dispatch-service
-frontend-net: dispatch-service, rider-ui
+kafka-net:    kafka-1, kafka-2, kafka-3, schema-registry, ingest-service, dispatch-service, notification-service, gateway-service
+db-net:       postgres, pgbouncer, redis, dynamodb-local, dispatch-service
+frontend-net: dispatch-service, gateway-service, rider-ui
+observability-net: jaeger, prometheus, grafana, ingest-service, dispatch-service, notification-service, gateway-service
 ```
 
 The Ingest Service and Notification Service have no access to `db-net`. The Rider UI has no access to `kafka-net` or `db-net`.
 
+### Observability
+
+All services instrument with OpenTelemetry from Phase 1. Production systems are not observable by accident — OTel is wired in from the first service, not retrofitted.
+
+- **Traces**: `trace_id` and `span_id` are propagated through Kafka message headers. Every hop (HTTP → Kafka produce → Kafka consume → DB write) is a span in the same trace. A single GPS ping is traceable end-to-end across all services.
+- **Metrics**: Every service exposes a Prometheus-format `/metrics` endpoint — Kafka consumer lag, HTTP p50/p95/p99 latency, DB query duration, WebSocket connection count.
+- **Logs**: Structured JSON with a `trace_id` field on every log line — logs correlate to traces in Jaeger/Grafana.
+- **Local dev**: Jaeger (`:16686`) for traces, Prometheus (`:9090`) + Grafana (`:3000`) for metrics, all in docker-compose.
+- **Production**: AWS X-Ray (traces) + Amazon Managed Prometheus + Grafana.
+
+**OTel SDK per language**:
+- Go services: `go.opentelemetry.io/otel` + `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`
+- Java (Dispatch): `io.opentelemetry:opentelemetry-spring-boot-starter`
+
+**Kafka trace propagation**: Producers inject `traceparent` / `tracestate` W3C headers into Kafka message headers. Consumers extract these headers and create child spans, maintaining the distributed trace across the async boundary.
+
 ### Kafka Topics
+
+All topics use `replication.factor=3`, `min.insync.replicas=2`. All messages are Avro-serialised via Confluent Schema Registry. Producers use `acks=all`, `enable.idempotence=true`.
 
 | Topic | Producers | Consumers | Purpose |
 |---|---|---|---|
-| `gps-pings` | ingest-service | dispatch-service (`dispatch-location-group`), tracking-service (Phase 2) | Driver location events |
-| `ride-events` | dispatch-service | dispatch-service (`dispatch-consumer-group`), notification-service (`notification-consumer-group`) | Trip lifecycle events |
+| `gps-pings` | ingest-service | dispatch-service (`dispatch-location-group`), tracking-service (Phase 2) | Driver location Avro events |
+| `ride-events` | dispatch-service | dispatch-service (`dispatch-consumer-group`), notification-service (`notification-consumer-group`), gateway-service (`gateway-consumer-group`) | Trip lifecycle Avro events |
 | `dispatch-commands` | (Phase 2) | (Phase 2) | Reserved |
 | `notifications` | notification-service (Phase 2) | — | Reserved |
 
@@ -93,7 +129,7 @@ The Ingest Service and Notification Service have no access to `db-net`. The Ride
 
 ### Ingest Service (`services/ingest/`)
 
-**Runtime**: Python 3.11, FastAPI, `confluent-kafka` Python client
+**Runtime**: Go 1.22, `net/http` (or `chi` router), `confluentinc/confluent-kafka-go` Kafka client, `go-playground/validator` for input validation
 
 **HTTP Interface**:
 
@@ -113,15 +149,20 @@ POST /location
 
 GET /health
   Response: 200 { "status": "ok" }
+
+GET /metrics
+  Response: 200 Prometheus text format
 ```
 
 **Kafka Producer**:
 - Topic: `gps-pings`
 - Message key: `driver_id` (ensures ordering per driver)
-- `enable.idempotence=true`
+- Serialisation: Avro via Confluent Schema Registry (`SCHEMA_REGISTRY_URL`)
+- Schema registered on first publish from `shared/avro/location_ping_received.avsc`
+- `acks=all`, `enable.idempotence=true`
 - On publish failure: return HTTP 503, log warning, do not silently drop
 
-**Domain Event published**:
+**Domain Event published** (Avro schema — `shared/avro/location_ping_received.avsc`):
 ```json
 {
   "event_id": "<uuid>",
@@ -129,8 +170,8 @@ GET /health
   "occurred_at": "<ISO 8601>",
   "payload": {
     "driver_id": "<string>",
-    "latitude": <float>,
-    "longitude": <float>,
+    "latitude": "<float>",
+    "longitude": "<float>",
     "timestamp": "<ISO 8601>"
   }
 }
@@ -138,7 +179,7 @@ GET /health
 
 **OpenAPI**: Auto-generated at startup, written to `services/ingest/openapi.json`.
 
-**Dockerfile**: `python:3.11.9-slim`, non-root user `appuser`.
+**Dockerfile**: Multi-stage — `golang:1.22-alpine` build stage → `gcr.io/distroless/static-debian12` final stage. Non-root user. No shell in final image.
 
 **Environment variables**:
 ```
@@ -146,7 +187,9 @@ KAFKA_BOOTSTRAP_SERVERS
 KAFKA_TOPIC_GPS_PINGS
 KAFKA_SASL_USERNAME
 KAFKA_SASL_PASSWORD
+SCHEMA_REGISTRY_URL
 SERVICE_PORT
+OTEL_EXPORTER_OTLP_ENDPOINT
 ```
 
 ---
@@ -179,9 +222,10 @@ GET /v3/api-docs
 
 1. **`ride-events` consumer** (group: `dispatch-consumer-group`)
    - Filters for `event_type == "TripRequested"`
+   - Deserialises Avro message via Schema Registry
    - Selects driver from static in-memory list (hardcoded Phase 1 matching)
-   - Updates Trip status to `ASSIGNED` in PostgreSQL
-   - Publishes `TripAssigned` event to `ride-events`
+   - Updates Trip status to `ASSIGNED` in PostgreSQL (via PgBouncer)
+   - Publishes `TripAssigned` Avro event to `ride-events`
    - Must complete within 2 seconds of consumption
 
 2. **`gps-pings` consumer** (group: `dispatch-location-group`)
@@ -192,12 +236,13 @@ GET /v3/api-docs
 
 **Kafka Producer**:
 - Topics: `ride-events`
-- `enable.idempotence=true`
+- Serialisation: Avro via Confluent Schema Registry (`SCHEMA_REGISTRY_URL`)
+- `acks=all`, `enable.idempotence=true`
 - Exponential backoff retry on startup (up to 5 attempts before non-zero exit)
 
 **Domain Events published**:
 
-`TripRequested`:
+`TripRequested` (Avro schema — `shared/avro/trip_requested.avsc`):
 ```json
 {
   "event_id": "<uuid>",
@@ -206,13 +251,13 @@ GET /v3/api-docs
   "payload": {
     "trip_id": "<uuid>",
     "rider_id": "<string>",
-    "pickup_location": { "latitude": <float>, "longitude": <float> },
+    "pickup_location": { "latitude": "<float>", "longitude": "<float>" },
     "requested_at": "<ISO 8601>"
   }
 }
 ```
 
-`TripAssigned`:
+`TripAssigned` (Avro schema — `shared/avro/trip_assigned.avsc`):
 ```json
 {
   "event_id": "<uuid>",
@@ -227,7 +272,7 @@ GET /v3/api-docs
 }
 ```
 
-`TripCancelled` (modelled in code, not triggered in Phase 1):
+`TripCancelled` (Avro schema — `shared/avro/trip_cancelled.avsc`, modelled in code, not triggered in Phase 1):
 ```json
 {
   "event_id": "<uuid>",
@@ -254,31 +299,38 @@ KAFKA_SASL_USERNAME
 KAFKA_SASL_PASSWORD
 KAFKA_CONSUMER_GROUP_RIDE_EVENTS
 KAFKA_CONSUMER_GROUP_GPS_PINGS
-SPRING_DATASOURCE_URL
+SCHEMA_REGISTRY_URL
+SPRING_DATASOURCE_URL          (points to PgBouncer, not PostgreSQL directly)
 SPRING_DATASOURCE_USERNAME
 SPRING_DATASOURCE_PASSWORD
 SERVICE_PORT
+OTEL_EXPORTER_OTLP_ENDPOINT
 ```
 
 ---
 
 ### Notification Service (`services/notification/`)
 
-**Runtime**: Python 3.11, FastAPI, `confluent-kafka` Python client
+**Runtime**: Go 1.22, `confluentinc/confluent-kafka-go` Kafka consumer
 
 **HTTP Interface**:
 
 ```
 GET /health
   Response: 200 { "status": "ok" }
+
+GET /metrics
+  Response: 200 Prometheus text format
 ```
 
 **Kafka Consumer** (group: `notification-consumer-group`):
 - Topic: `ride-events`
+- Deserialises Avro messages via Confluent Schema Registry (`SCHEMA_REGISTRY_URL`)
 - Filters for `event_type == "TripAssigned"` — all other event types are acknowledged and skipped
 - On `TripAssigned`: logs structured JSON to stdout
-- On non-JSON message: logs WARNING with raw bytes, continues
+- On Avro deserialisation failure: logs WARNING with raw bytes, continues
 - Duplicate `TripAssigned` deliveries: logged again (idempotent log writes acceptable in Phase 1)
+- Phase 2: DynamoDB `processed_events` table provides atomic dedup via `ConditionExpression: attribute_not_exists(event_id)`
 
 **Stdout log format** (one JSON line per notification):
 ```json
@@ -289,13 +341,14 @@ GET /health
   "driver_id": "<string>",
   "rider_id": "<string>",
   "assigned_at": "<ISO 8601>",
-  "notification_sent_at": "<ISO 8601>"
+  "notification_sent_at": "<ISO 8601>",
+  "trace_id": "<string>"
 }
 ```
 
 **OpenAPI**: Auto-generated at startup, written to `services/notification/openapi.json`.
 
-**Dockerfile**: `python:3.11.9-slim`, non-root user `appuser`.
+**Dockerfile**: Multi-stage — `golang:1.22-alpine` build stage → `gcr.io/distroless/static-debian12` final stage. Non-root user. No shell in final image.
 
 **Environment variables**:
 ```
@@ -304,7 +357,59 @@ KAFKA_TOPIC_RIDE_EVENTS
 KAFKA_SASL_USERNAME
 KAFKA_SASL_PASSWORD
 KAFKA_CONSUMER_GROUP_ID
+SCHEMA_REGISTRY_URL
 SERVICE_PORT
+OTEL_EXPORTER_OTLP_ENDPOINT
+```
+
+---
+
+### Gateway Service (`services/gateway/`)
+
+**Runtime**: Go 1.22, `gorilla/websocket` or `nhooyr.io/websocket`, `confluentinc/confluent-kafka-go` Kafka consumer
+
+**HTTP / WebSocket Interface**:
+
+```
+GET /ws?rider_id=<string>
+  Upgrades to WebSocket connection.
+  Server pushes Domain Event payloads as JSON frames to the connected rider.
+
+GET /health
+  Response: 200 { "status": "ok" }
+
+GET /metrics
+  Response: 200 Prometheus text format
+```
+
+**Role**: The Gateway Service is a **Kafka consumer** (`gateway-consumer-group`) — Kafka fans out events to it. Its sole job is **protocol translation**: Kafka Domain Event → WebSocket frame pushed to the connected rider. It does NOT fan out events; Kafka does that via consumer groups.
+
+**Kafka Consumer** (group: `gateway-consumer-group`):
+- Topics: `ride-events` (filters `TripAssigned`, `TripCancelled`, `TripCompleted`) and `ETAUpdated`
+- Deserialises Avro messages via Confluent Schema Registry
+- On each consumed event: looks up `rider_id` in session registry → pushes JSON frame over WebSocket
+
+**Session Registry**:
+- Phase 1: in-memory `map[rider_id → *websocket.Conn]` (single instance)
+- Phase 2: Redis Pub/Sub (`HSET gateway:sessions:{rider_id} instance_id connection_id`) for multi-instance fan-out
+
+**Owns**:
+- WebSocket connection lifecycle (accept, heartbeat, graceful disconnect)
+- Session registry (`rider_id → WebSocket connection`)
+- No domain logic, no DB writes — pure infrastructure / protocol bridge
+
+**Dockerfile**: Multi-stage — `golang:1.22-alpine` build stage → `gcr.io/distroless/static-debian12` final stage. Non-root user.
+
+**Environment variables**:
+```
+KAFKA_BOOTSTRAP_SERVERS
+KAFKA_TOPIC_RIDE_EVENTS
+KAFKA_SASL_USERNAME
+KAFKA_SASL_PASSWORD
+KAFKA_CONSUMER_GROUP_ID
+SCHEMA_REGISTRY_URL
+SERVICE_PORT
+OTEL_EXPORTER_OTLP_ENDPOINT
 ```
 
 ---
@@ -359,98 +464,109 @@ This section specifies the internal module structure, design patterns, and key f
 
 ```
 services/ingest/
-  main.py                          — FastAPI app factory, lifespan context manager, route registration
-  config.py                        — Settings class (pydantic-settings), fail-fast env var loading
-  models.py                        — Pydantic request/response models (GpsPingRequest, LocationAcceptedResponse)
-  kafka_producer.py                — KafkaProducerClient class (singleton via module-level instance)
-  events.py                        — DomainEvent dataclass, build_location_ping_event() factory function
-  routers/
-    location.py                    — POST /location route handler
-    health.py                      — GET /health route handler
-  tests/
-    test_location_endpoint.py      — unit + property tests (Hypothesis)
-    test_kafka_producer.py         — unit tests with mocked confluent-kafka
+  main.go                    — HTTP server setup (chi router), middleware chain, graceful shutdown
+  config/config.go           — Config struct, fail-fast env var loading via os.Getenv; exits non-zero on missing var
+  handler/location.go        — POST /location handler; LocationHandler struct with Producer field
+  handler/health.go          — GET /health handler
+  kafka/producer.go          — Producer struct; Avro serialisation via Schema Registry client; Publish() returns (string, error)
+  model/gps_ping.go          — GpsPingRequest struct with go-playground/validator tags
+  events/location_ping.go    — BuildLocationPingEvent() factory function; generates event_id (UUID4) and occurred_at
+  middleware/body_size.go    — MaxBodySize(limit int64) middleware func(http.Handler) http.Handler
+  tests/                     — Go test files using testing + testify + pgregory.net/rapid (PBT)
 ```
 
 #### Design Patterns Applied
 
-- **Dependency Injection**: `KafkaProducerClient` is injected into route handlers via FastAPI `Depends()`. It is never instantiated inside the handler body — the handler declares it as a parameter and FastAPI resolves it from the module-level singleton.
-- **Factory Function**: `build_location_ping_event(ping: GpsPingRequest) -> DomainEvent` constructs the full event envelope. UUID generation (`event_id`) and timestamp generation (`occurred_at`) are isolated inside this function, making it a pure, deterministic-input function that is straightforward to test with Hypothesis.
-- **Settings Object (12-Factor)**: `pydantic-settings` `Settings` class reads all required environment variables at import time. If any required variable is absent, `ValidationError` is raised before the ASGI app starts — the service never starts with a missing configuration.
-- **Middleware for body size**: `MaxBodySizeMiddleware` is a Starlette `BaseHTTPMiddleware` subclass applied at the app level in `main.py`. The 64 KB limit is enforced before the request body reaches any route handler — it is not checked inline in the handler.
-- **Result type for Kafka publish**: `KafkaProducerClient.publish()` raises `KafkaPublishError` on failure rather than returning a sentinel value. The route handler catches `KafkaPublishError` and converts it to HTTP 503. This keeps the happy path clean and avoids silent error swallowing.
+- **Dependency Injection**: `LocationHandler` is a struct with a `Producer` field set at construction time in `main.go`. The handler method is a method on the struct — the producer is never instantiated inside the handler body. No framework magic; plain Go constructor injection.
+- **Factory Function**: `BuildLocationPingEvent(ping GpsPingRequest) DomainEvent` constructs the full Avro event envelope. UUID generation (`event_id`) and timestamp generation (`occurred_at`) are isolated inside this function, making it a pure, deterministic-input function that is straightforward to test with `rapid`.
+- **Config struct (12-Factor)**: `config.Config` is populated by `LoadConfig()` which calls `os.Getenv` for each required variable. If any required variable is absent, `LoadConfig()` logs a descriptive error identifying the missing variable and calls `os.Exit(1)` — the server never starts with a missing configuration.
+- **Middleware for body size**: `MaxBodySize(limit int64) func(http.Handler) http.Handler` is a standard Go middleware applied in the `chi` router chain in `main.go`. The 64 KB limit is enforced before the request body reaches any handler — it is not checked inline in the handler.
+- **Error return for Kafka publish**: `Producer.Publish()` returns `(string, error)`. The handler checks the error and returns HTTP 503 on failure. This keeps the happy path clean and avoids silent error swallowing.
 
 #### Key Function Signatures
 
-```python
-# config.py
-from pydantic_settings import BaseSettings
+```go
+// config/config.go
+package config
 
-class Settings(BaseSettings):
-    kafka_bootstrap_servers: str
-    kafka_topic_gps_pings: str
-    kafka_sasl_username: str
-    kafka_sasl_password: str
-    service_port: int = 8001
+type Config struct {
+    KafkaBootstrapServers string
+    KafkaTopic            string
+    KafkaSASLUsername     string
+    KafkaSASLPassword     string
+    SchemaRegistryURL     string
+    ServicePort           string
+    OTELEndpoint          string
+}
 
-    class Config:
-        env_file = ".env"
+// LoadConfig reads all required env vars via os.Getenv.
+// Logs a descriptive error and calls os.Exit(1) if any required var is absent.
+func LoadConfig() Config { ... }
 
-# events.py
-from dataclasses import dataclass
+// events/location_ping.go
+package events
 
-@dataclass(frozen=True)
-class DomainEvent:
-    event_id: str        # UUID4, generated at publish time
-    event_type: str
-    occurred_at: str     # ISO 8601
-    payload: dict
+type DomainEvent struct {
+    EventID    string                 // UUID4, generated at publish time
+    EventType  string
+    OccurredAt string                 // ISO 8601
+    Payload    map[string]interface{}
+}
 
-def build_location_ping_event(ping: GpsPingRequest) -> DomainEvent:
-    """
-    Pure factory: generates event_id (UUID4) and occurred_at (utcnow ISO 8601),
-    copies driver_id, latitude, longitude, timestamp from ping into payload.
-    Never raises — all inputs are pre-validated by Pydantic.
-    """
+// BuildLocationPingEvent constructs the full Avro event envelope.
+// Generates EventID (UUID4) and OccurredAt (time.Now().UTC() ISO 8601).
+// Copies driver_id, latitude, longitude, timestamp from ping into Payload.
+// Never returns an error — all inputs are pre-validated.
+func BuildLocationPingEvent(ping model.GpsPingRequest) DomainEvent { ... }
 
-# kafka_producer.py
-class KafkaProducerClient:
-    def __init__(self, settings: Settings) -> None:
-        """Initialises confluent-kafka Producer with SASL/PLAIN and enable.idempotence=true."""
+// kafka/producer.go
+package kafka
 
-    def publish(self, topic: str, key: str, event: DomainEvent) -> str:
-        """
-        Serialises event to JSON, calls producer.produce(), flushes.
-        Returns event_id on success.
-        Raises KafkaPublishError on delivery failure.
-        """
+type Producer struct {
+    producer          *confluent.Producer
+    schemaRegistryURL string
+    topic             string
+}
 
-# routers/location.py
-from fastapi import Depends
+func NewProducer(cfg config.Config) (*Producer, error) { ... }
 
-async def ingest_location(
-    ping: GpsPingRequest,
-    producer: KafkaProducerClient = Depends(get_producer),
-) -> LocationAcceptedResponse:
-    """
-    Builds DomainEvent via build_location_ping_event(ping).
-    Calls producer.publish(topic, key=ping.driver_id, event).
-    Returns 202 LocationAcceptedResponse(message_id=event.event_id).
-    Raises HTTPException(503) on KafkaPublishError.
-    """
+// Publish serialises event as Avro via Schema Registry, calls producer.Produce(), flushes.
+// Returns event_id on success. Returns error on delivery failure — caller returns HTTP 503.
+func (p *Producer) Publish(key string, event events.DomainEvent) (string, error) { ... }
+
+// handler/location.go
+package handler
+
+type LocationHandler struct {
+    Producer *kafka.Producer
+}
+
+// ServeHTTP handles POST /location.
+// Decodes and validates GpsPingRequest, calls BuildLocationPingEvent, calls Producer.Publish.
+// Returns 202 { "message_id": event_id } on success; 503 on Kafka error.
+func (h *LocationHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { ... }
+
+// middleware/body_size.go
+package middleware
+
+// MaxBodySize returns a middleware that limits request body to limit bytes.
+// Returns HTTP 413 if the body exceeds the limit before the handler is called.
+func MaxBodySize(limit int64) func(http.Handler) http.Handler { ... }
 ```
 
 #### Sequence: POST /location (happy path)
 
 ```
 Client → POST /location (JSON body)
-  → MaxBodySizeMiddleware: body ≤ 64 KB? → pass
-  → Pydantic GpsPingRequest validation → 422 if invalid
-  → ingest_location() handler
-      → build_location_ping_event(ping) → DomainEvent
-      → producer.publish(topic, key=driver_id, event)
-          → confluent-kafka produce + flush
-      → return 202 { "message_id": event.event_id }
+  → MaxBodySize middleware: body ≤ 64 KB? → pass; else 413
+  → LocationHandler.ServeHTTP()
+      → json.Decode → GpsPingRequest; validate struct tags → 422 if invalid
+      → BuildLocationPingEvent(ping) → DomainEvent
+      → Producer.Publish(key=driver_id, event)
+          → Avro serialise via Schema Registry
+          → confluent-kafka Produce() + Flush()
+      → return 202 { "message_id": event.EventID }
+      → on error: return 503
 ```
 
 ---
@@ -625,115 +741,101 @@ Client → POST /request-ride (JSON body)
 
 ```
 services/notification/
-  main.py                              — FastAPI app factory, lifespan starts KafkaConsumerWorker thread
-  config.py                            — Settings class (pydantic-settings)
-  consumer.py                          — KafkaConsumerWorker class, runs in background thread
-  handlers.py                          — handle_trip_assigned(event, logger) -> None
-  events.py                            — TripAssignedEvent dataclass, parse_trip_assigned() factory
-  logger.py                            — get_structured_logger() returns JSON-to-stdout logger
-  routers/
-    health.py                          — GET /health
-  tests/
-    test_notification_consumer.py      — unit + property tests (Hypothesis)
+  main.go                    — starts consumer worker goroutine, HTTP health server, graceful shutdown
+  config/config.go           — Config struct, fail-fast env var loading via os.Getenv; exits non-zero on missing var
+  consumer/worker.go         — Worker struct; Start(), Stop(); handler dispatch map[string]HandlerFunc
+  handler/trip_assigned.go   — HandleTripAssigned(event TripAssignedEvent, logger *logger.Logger)
+  events/trip_assigned.go    — TripAssignedEvent struct (unexported fields); ParseTripAssigned() factory
+  logger/logger.go           — structured JSON logger (zerolog or slog) emitting to stdout
+  tests/                     — Go test files using testing + testify + pgregory.net/rapid (PBT)
 ```
 
 #### Design Patterns Applied
 
-- **Observer / Handler dispatch**: `KafkaConsumerWorker` maintains a `dict[str, Callable]` registry mapping `event_type` strings to handler callables. The consumer loop calls `handlers.get(event_type, skip_handler)(event)`. Adding a new event type handler requires no changes to the consumer loop — only a new entry in the registry.
-- **Structured logging via adapter**: `NotificationLogger` wraps stdlib `logging` and always emits JSON to stdout. Handlers call `logger.log_notification(event)` — never `print()` or raw `logging.info()`. This ensures every log line is machine-parseable and consistently structured.
-- **Null Object for skipped events**: When `event_type != "TripAssigned"`, the consumer dispatches to `SkipHandler` — a no-op callable — rather than an inline `if/else`. This keeps the dispatch loop uniform and avoids branching logic in the consumer.
-- **Frozen dataclass for parsed events**: `TripAssignedEvent` is a `@dataclass(frozen=True)`. `parse_trip_assigned(envelope: dict) -> TripAssignedEvent` validates all required fields and raises `EventParseError` if any are missing. The handler never receives a partially-constructed event.
+- **Observer / Handler dispatch**: `Worker` maintains a `map[string]HandlerFunc` registry keyed by `event_type`. The consumer loop calls `handlers[eventType](event)`, falling back to `NoOpHandler` for unknown types. Adding a new event type handler requires no changes to the consumer loop — only a new entry in the map.
+- **Structured logging**: `logger.Logger` wraps zerolog (or slog) and always emits JSON to stdout. Handlers call `logger.LogNotification(event)` — never `fmt.Println()` or raw log calls. This ensures every log line is machine-parseable, consistently structured, and includes `trace_id`.
+- **Null Object for skipped events**: When `event_type != "TripAssigned"`, the consumer dispatches to `NoOpHandler` — a no-op `HandlerFunc` — rather than an inline `if/else`. This keeps the dispatch loop uniform and avoids branching logic in the consumer.
+- **Frozen struct for parsed events**: `TripAssignedEvent` has unexported fields. `ParseTripAssigned(envelope map[string]interface{}) (TripAssignedEvent, error)` validates all required fields and returns an error if any are missing. The handler never receives a partially-constructed event.
 
 #### Key Function Signatures
 
-```python
-# events.py
-from dataclasses import dataclass
+```go
+// events/trip_assigned.go
+package events
 
-@dataclass(frozen=True)
-class TripAssignedEvent:
-    event_id: str
-    event_type: str
-    trip_id: str
-    driver_id: str
-    rider_id: str
-    assigned_at: str
+// TripAssignedEvent has unexported fields — constructed only via ParseTripAssigned.
+type TripAssignedEvent struct {
+    eventID    string
+    eventType  string
+    tripID     string
+    driverID   string
+    riderID    string
+    assignedAt string
+}
 
-def parse_trip_assigned(envelope: dict) -> TripAssignedEvent:
-    """
-    Extracts and validates required fields from the envelope dict.
-    Raises EventParseError (with field name) if any required field is absent or empty.
-    Never returns a partially-constructed TripAssignedEvent.
-    """
+// Accessor methods for handler use
+func (e TripAssignedEvent) EventID() string    { return e.eventID }
+func (e TripAssignedEvent) TripID() string     { return e.tripID }
+func (e TripAssignedEvent) DriverID() string   { return e.driverID }
+func (e TripAssignedEvent) RiderID() string    { return e.riderID }
+func (e TripAssignedEvent) AssignedAt() string { return e.assignedAt }
 
-# handlers.py
-from notification.logger import NotificationLogger
+// ParseTripAssigned extracts and validates required fields from the Avro-decoded envelope map.
+// Returns EventParseError (with field name) if any required field is absent or empty.
+// Never returns a partially-constructed TripAssignedEvent.
+func ParseTripAssigned(envelope map[string]interface{}) (TripAssignedEvent, error) { ... }
 
-def handle_trip_assigned(event: TripAssignedEvent, logger: NotificationLogger) -> None:
-    """
-    Writes one structured JSON line to stdout via logger.log_notification(event).
-    The JSON line includes: event_id, event_type, trip_id, driver_id, rider_id,
-    assigned_at, notification_sent_at (utcnow ISO 8601).
-    """
+// handler/trip_assigned.go
+package handler
 
-def skip_handler(event: object) -> None:
-    """No-op. Called for all event_type values other than 'TripAssigned'."""
+// HandleTripAssigned writes one structured JSON line to stdout via logger.LogNotification.
+// The JSON line includes: event_id, event_type, trip_id, driver_id, rider_id,
+// assigned_at, notification_sent_at (time.Now().UTC() ISO 8601), trace_id.
+func HandleTripAssigned(event events.TripAssignedEvent, log *logger.Logger) { ... }
 
-# consumer.py
-class KafkaConsumerWorker:
-    def __init__(
-        self,
-        settings: Settings,
-        handlers: dict[str, Callable],   # e.g. {"TripAssigned": handle_trip_assigned}
-    ) -> None: ...
+// NoOpHandler is a no-op HandlerFunc for all event_type values other than "TripAssigned".
+func NoOpHandler(event interface{}) {}
 
-    def start(self) -> None:
-        """Starts the consumer loop in a daemon background thread."""
+// consumer/worker.go
+package consumer
 
-    def stop(self) -> None:
-        """Sets the stop flag; waits for the background thread to finish (graceful shutdown)."""
+type HandlerFunc func(envelope map[string]interface{})
 
-    def _run(self) -> None:
-        """
-        Consumer loop:
-          poll() → deserialise JSON → extract event_type
-          → handlers.get(event_type, skip_handler)(parsed_event)
-          → commit offset
-          On JSON deserialisation failure: log WARNING with raw bytes, commit offset, continue.
-        """
+type Worker struct {
+    consumer *confluent.Consumer
+    handlers map[string]HandlerFunc
+    stopCh   chan struct{}
+}
 
-# logger.py
-import logging
-import json
+func NewWorker(cfg config.Config, handlers map[string]HandlerFunc) (*Worker, error) { ... }
 
-class NotificationLogger:
-    def __init__(self) -> None:
-        self._logger = logging.getLogger("notification")
-        # Configured for JSON output to stdout in get_structured_logger()
+// Start launches the consumer loop in a goroutine. Returns immediately.
+func (w *Worker) Start() { ... }
 
-    def log_notification(self, event: TripAssignedEvent) -> None:
-        """Emits one JSON log line to stdout with all required fields + notification_sent_at."""
+// Stop signals the consumer loop to stop and waits for it to finish (graceful shutdown).
+func (w *Worker) Stop() { ... }
 
-    def log_warning(self, message: str, **context) -> None:
-        """Emits a JSON warning line to stderr."""
-
-def get_structured_logger() -> NotificationLogger:
-    """Configures stdlib logging for JSON stdout output and returns a NotificationLogger."""
+// run is the consumer loop:
+//   poll() → Avro deserialise via Schema Registry → extract event_type
+//   → handlers[eventType](envelope), fallback to NoOpHandler
+//   → commit offset
+//   On Avro deserialisation failure: log WARNING with raw bytes, commit offset, continue.
+func (w *Worker) run() { ... }
 ```
 
 #### Sequence: TripAssigned consumed (happy path)
 
 ```
-Kafka ride-events topic → KafkaConsumerWorker._run()
-  → consumer.poll()
-  → JSON deserialise → envelope dict
+Kafka ride-events topic → Worker.run() goroutine
+  → consumer.Poll()
+  → Avro deserialise via Schema Registry → envelope map
   → extract event_type = "TripAssigned"
   → handlers["TripAssigned"](envelope)
-      → parse_trip_assigned(envelope) → TripAssignedEvent
-      → handle_trip_assigned(event, logger)
-          → logger.log_notification(event)
-              → stdout: { "event_id": ..., "trip_id": ..., ..., "notification_sent_at": ... }
-  → consumer.commit()
+      → ParseTripAssigned(envelope) → TripAssignedEvent
+      → HandleTripAssigned(event, logger)
+          → logger.LogNotification(event)
+              → stdout: { "event_id": ..., "trip_id": ..., ..., "notification_sent_at": ..., "trace_id": ... }
+  → consumer.CommitOffsets()
 ```
 
 ---
@@ -742,27 +844,40 @@ Kafka ride-events topic → KafkaConsumerWorker._run()
 
 The `shared/` directory contains only infrastructure concerns — never domain objects. Domain types (`Trip`, `DriverLocation`, `Notification`) are defined within their respective bounded contexts.
 
-#### Python (`shared/envelope.py`)
+#### Avro Schemas (`shared/avro/`)
 
-```python
-# shared/envelope.py
-from dataclasses import dataclass
+All Domain Events are serialised as Avro using Confluent Schema Registry. One `.avsc` file per Domain Event type:
 
-@dataclass(frozen=True)
-class DomainEventEnvelope:
-    event_id: str
-    event_type: str
-    occurred_at: str     # ISO 8601
-    payload: dict
+```
+shared/avro/
+  location_ping_received.avsc   — LocationPingReceived event schema
+  trip_requested.avsc           — TripRequested event schema
+  trip_assigned.avsc            — TripAssigned event schema
+  trip_cancelled.avsc           — TripCancelled event schema (modelled in Phase 1, not triggered)
+```
 
-def validate_envelope(raw: dict) -> DomainEventEnvelope:
-    """
-    Validates that event_id is a non-empty string, event_type is a non-empty string,
-    occurred_at is present, and payload is a dict.
-    Raises EnvelopeValidationError with a descriptive message identifying the failing field.
-    Does NOT validate payload contents — that is the responsibility of each service's
-    event-specific parser (e.g., parse_trip_assigned).
-    """
+All schemas share the same envelope structure with `event_id`, `event_type`, `occurred_at`, and `payload` fields. The `event_type` field in the Avro envelope is used by consumers for filtering — it is part of the schema contract, not a Kafka header.
+
+#### Go (`shared/envelope/envelope.go`)
+
+```go
+// shared/envelope/envelope.go
+package envelope
+
+// DomainEventEnvelope is the standard Kafka message envelope for all Domain Events.
+// Used by Go services (Ingest, Notification, Gateway, Tracking).
+type DomainEventEnvelope struct {
+    EventID    string                 `avro:"event_id"`
+    EventType  string                 `avro:"event_type"`
+    OccurredAt string                 `avro:"occurred_at"` // ISO 8601
+    Payload    map[string]interface{} `avro:"payload"`
+}
+
+// Validate checks that EventID is a non-empty UUID string and EventType is non-empty.
+// Returns an EnvelopeValidationError identifying the failing field.
+// Does NOT validate Payload contents — that is the responsibility of each service's
+// event-specific parser (e.g., ParseTripAssigned).
+func Validate(e DomainEventEnvelope) error { ... }
 ```
 
 #### Java (`shared/KafkaEnvelope.java`)
@@ -784,7 +899,7 @@ public record KafkaEnvelope(
 }
 ```
 
-**Constraint**: The `shared/` module MUST NOT contain `Trip`, `DriverLocation`, `Notification`, or any other domain aggregate or value object. If a type is needed in more than one service, each service defines its own representation. Shared types are limited to: envelope schema, health check DTOs, common error shapes, and proto/Avro definitions.
+**Constraint**: The `shared/` module MUST NOT contain `Trip`, `DriverLocation`, `Notification`, or any other domain aggregate or value object. If a type is needed in more than one service, each service defines its own representation. Shared types are limited to: Avro schemas (Schema Registry), envelope types, health check DTOs, common error shapes, and proto definitions.
 
 ---
 
@@ -792,18 +907,20 @@ public record KafkaEnvelope(
 
 | Pattern | Service(s) | Implementation |
 |---|---|---|
-| Dependency Injection | Ingest, Notification | FastAPI `Depends(get_producer)` for `KafkaProducerClient`; constructor injection of `handlers` dict in `KafkaConsumerWorker` |
-| Factory Function / Method | All | `build_location_ping_event()` (Ingest), `EventEnvelopeFactory.buildTripRequested/Assigned()` (Dispatch), `parse_trip_assigned()` (Notification) |
-| Settings Object (12-Factor) | Ingest, Notification | `pydantic-settings` `Settings` class; `ValidationError` raised at import time on missing vars |
+| Dependency Injection | Ingest, Notification | Constructor injection: `LocationHandler{Producer: p}` (Ingest); `NewWorker(cfg, handlers)` (Notification) — no framework magic, plain Go structs |
+| Factory Function / Method | All | `BuildLocationPingEvent()` (Ingest Go), `EventEnvelopeFactory.buildTripRequested/Assigned()` (Dispatch Java), `ParseTripAssigned()` (Notification Go) |
+| Config struct (12-Factor) | Ingest, Notification | `config.LoadConfig()` reads via `os.Getenv`; calls `os.Exit(1)` with descriptive error on missing var |
 | State Machine with guard | Dispatch | `TripStatus.assertCanTransitionTo()` — invalid transitions throw `IllegalStateTransitionException` |
 | Strategy (stub) | Dispatch | `DriverSelectionStrategy` interface + `HardcodedDriverSelectionStrategy`; `DispatchService` depends on the interface |
-| Observer / Handler dispatch | Notification | `KafkaConsumerWorker` handler registry `dict[str, Callable]` keyed by `event_type` |
-| Null Object | Notification | `skip_handler` no-op callable for non-`TripAssigned` event types |
-| Structured logging adapter | Notification | `NotificationLogger` wrapping stdlib JSON logger; all log output goes through `log_notification()` / `log_warning()` |
-| Middleware (body size) | Ingest | `MaxBodySizeMiddleware(max_bytes=65536)` applied at app level in `main.py` |
+| Observer / Handler dispatch | Notification | `Worker` handler registry `map[string]HandlerFunc` keyed by `event_type` |
+| Null Object | Notification | `NoOpHandler` no-op `HandlerFunc` for non-`TripAssigned` event types |
+| Structured logging | Notification | `logger.Logger` wrapping zerolog/slog; all log output goes through `LogNotification()` / `LogWarning()`; includes `trace_id` field |
+| Middleware (body size) | Ingest | `MaxBodySize(65536)` standard Go middleware applied in `chi` router chain in `main.go` |
 | Fail-fast `@PostConstruct` | Dispatch | `AppConfig.validateRequiredEnvVars()` — throws `IllegalStateException` with missing var name before context finishes loading |
-| Envelope validation | Dispatch, Notification | `EnvelopeValidator.validate()` (Java), `validate_envelope()` (Python) — stateless, independently testable |
-| Idempotent Kafka producer | Ingest, Dispatch | `enable.idempotence=true` on all producers; prevents duplicate delivery within a producer session |
+| Envelope validation | Dispatch, Notification | `EnvelopeValidator.validate()` (Java), `envelope.Validate()` (Go) — stateless, independently testable |
+| Idempotent Kafka producer | Ingest, Dispatch | `acks=all`, `enable.idempotence=true` on all producers; prevents duplicate delivery within a producer session |
+| Avro / Schema Registry | All Kafka producers/consumers | `confluentinc/confluent-kafka-go` + Schema Registry client (Go); `spring-kafka` + Confluent Avro serialiser (Java); schemas in `shared/avro/` |
+| OpenTelemetry traces + metrics | All services | `go.opentelemetry.io/otel` + `otelhttp` (Go); `opentelemetry-spring-boot-starter` (Java); `traceparent` / `tracestate` W3C headers propagated through Kafka message headers; Prometheus `/metrics` on every service |
 
 ---
 
@@ -1035,32 +1152,32 @@ Unit tests cover specific examples, edge cases, and error conditions. Property-b
 ### Property-Based Testing
 
 **Library selection**:
-- Python services (Ingest, Notification): [Hypothesis](https://hypothesis.readthedocs.io/) — the standard PBT library for Python
+- Go services (Ingest, Notification): [pgregory.net/rapid](https://pkg.go.dev/pgregory.net/rapid) — property-based testing for Go; integrates with `testing.T`; generates shrinkable counterexamples
 - Java service (Dispatch): [jqwik](https://jqwik.net/) — property-based testing for JUnit 5
 
-**Configuration**: Each property test runs a minimum of 100 iterations. Kafka interactions are mocked (using `unittest.mock` / Mockito) to keep tests fast and deterministic.
+**Configuration**: Each property test runs a minimum of 100 iterations. Kafka interactions are mocked using the confluent-kafka-go mock producer/consumer (Ingest, Notification) and Mockito (Dispatch) to keep tests fast and deterministic.
 
 **Tag format**: Each property test is tagged with a comment referencing the design property:
-```
-# Feature: e2e-skeleton, Property 1: GPS ping event envelope round-trip
+```go
+// Feature: e2e-skeleton, Property 1: GPS ping event envelope round-trip
 ```
 
 **Property test mapping**:
 
 | Property | Service | Library | What is generated |
 |---|---|---|---|
-| 1: GPS ping envelope round-trip | Ingest | Hypothesis | Random driver_id (1–128 chars), lat/lng in valid range, ISO 8601 timestamps |
-| 2: Invalid GPS ping inputs rejected | Ingest | Hypothesis | Missing fields, out-of-range coordinates, empty/oversized driver_id |
+| 1: GPS ping envelope round-trip | Ingest | rapid | Random driver_id (1–128 chars), lat/lng in valid range, ISO 8601 timestamps |
+| 2: Invalid GPS ping inputs rejected | Ingest | rapid | Missing fields, out-of-range coordinates, empty/oversized driver_id |
 | 3: TripAssigned envelope correctness | Dispatch | jqwik | Random trip_id UUIDs, rider_id strings, pickup coordinates |
 | 4: Dispatch event type filtering | Dispatch | jqwik | Random event_type strings (excluding "TripRequested") |
-| 5: 64 KB body size enforcement | Ingest + Dispatch | Hypothesis + jqwik | Payloads of varying byte sizes around the 64 KB boundary |
-| 6: gps-pings envelope validation | Dispatch | jqwik | Valid envelopes, missing event_id, wrong event_type, non-JSON bytes |
-| 7: Notification logs required fields | Notification | Hypothesis | Random TripAssigned payloads with varying field values |
-| 8: Notification filters non-TripAssigned | Notification | Hypothesis | Random event_type strings (excluding "TripAssigned") |
+| 5: 64 KB body size enforcement | Ingest + Dispatch | rapid + jqwik | Payloads of varying byte sizes around the 64 KB boundary |
+| 6: gps-pings envelope validation | Dispatch | jqwik | Valid envelopes, missing event_id, wrong event_type, non-Avro bytes |
+| 7: Notification logs required fields | Notification | rapid | Random TripAssigned payloads with varying field values |
+| 8: Notification filters non-TripAssigned | Notification | rapid | Random event_type strings (excluding "TripAssigned") |
 | 9: Trip state machine persistence | Dispatch | jqwik | Random rider_id, pickup coordinates; verifies DB state transitions |
-| 10: trip_id correlation | Integration | Hypothesis | Random ride requests; verifies end-to-end trip_id invariant |
-| 11: Driver Simulator route looping | Simulator | Hypothesis | GeoJSON routes of varying lengths (2–100 coordinate pairs) |
-| 12: Startup fails fast on missing env vars | All services | Hypothesis + jqwik | Each required env var omitted in turn |
+| 10: trip_id correlation | Integration | rapid | Random ride requests; verifies end-to-end trip_id invariant |
+| 11: Driver Simulator route looping | Simulator | rapid | GeoJSON routes of varying lengths (2–100 coordinate pairs) |
+| 12: Startup fails fast on missing env vars | All services | rapid + jqwik | Each required env var omitted in turn |
 
 ### Unit Tests
 
@@ -1094,8 +1211,8 @@ Dockerfile and directory structure checks are validated as part of the CI pipeli
 
 ```
 services/ingest/tests/
-  test_location_endpoint.py       — unit + property tests (Hypothesis)
-  test_kafka_producer.py          — unit tests with mocked Kafka
+  location_handler_test.go        — unit + property tests (rapid)
+  kafka_producer_test.go          — unit tests with confluent-kafka-go mock producer
 
 services/dispatch/src/test/java/
   LocationPingConsumerTest.java   — property tests (jqwik)
@@ -1104,7 +1221,7 @@ services/dispatch/src/test/java/
   TripRepositoryTest.java         — unit tests (H2 in-memory)
 
 services/notification/tests/
-  test_notification_consumer.py  — unit + property tests (Hypothesis)
+  worker_test.go                  — unit + property tests (rapid)
 
 scripts/
   smoke_test.sh                  — end-to-end smoke test

@@ -115,4 +115,18 @@ I'd like to use Kafka with Kraft, instead. Please update. everywhere.
 
 I have asked you to move from Redpanda to Kafka + KRaft because I want to build FAANG scale, production-grade, real-world distributed systems that I can demonstrate. I want you to keep this in mind and suggest better technologies/design wherever you see fit. Make the suggestions ongoing as we build iteratively.
 
+### Adding more technologies
 
+Yes I’d like you to add this clarification to the changes you have recommended to improve the current stack to FAANG-scale production. One change I want to make is AWS secret manager instead of Hashicorp Vault. Also I would like to appropriately fit the following backend competencies into our design: ├── Event Streaming: Apache Kafka, AWS Kinesis ├── Containerization: Docker, Kubernetes, AWS EKS └── Data Storage: PostgreSQL (Query Optimization), Redis, DynamoDB
+
+### Vault
+
+I have changed my mind, I'd like you to please use Hashicorp Vault over AWS secrets manager.
+
+### Observability
+
+I see a section for Observability, but I still see stdout in requirements. Please explain.
+
+## AWS cost
+
+Please keep in mind that I want to keep costs down, especially AWS costs, while making no concessions on the right technology choice for a FAANG scale distributed system. I would like to spin up this demo only when needed to save costs. Any guidance please?

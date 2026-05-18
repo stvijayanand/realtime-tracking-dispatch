@@ -2,289 +2,400 @@
 
 ## Overview
 
-Build the foundational end-to-end data flow for the Real-Time Ride/Delivery Tracking & Dispatch Platform. The implementation proceeds infrastructure-first: monorepo scaffold and shared schema, then each service with its property-based tests, then the docker-compose environment with security controls, and finally the smoke test and end-to-end validation. Each step is independently verifiable before the next begins.
-
-Languages: Python 3.11 (Ingest, Notification, Driver Simulator), Java 21 / Spring Boot 3.x (Dispatch), TypeScript / React 18 (Rider UI), Bash (scripts).
-
-LLD reference: All tasks below reference the exact module structures, design patterns, and class/function signatures defined in the Low-Level Design section of `design.md`.
-
----
+This plan converts the e2e-skeleton design into incremental coding tasks that build the full GPS-ping-to-notification pipeline. Each task builds on the previous, ending with all services wired together in docker-compose. The stack is: Go 1.22 (Ingest, Notification, Gateway), Java 21 / Spring Boot 3.x (Dispatch), Python 3.11 (Driver Simulator), React 18 TypeScript (Rider UI), 3-broker Kafka KRaft cluster with Confluent Schema Registry, PgBouncer → PostgreSQL, DynamoDB Local, and OpenTelemetry → Jaeger + Prometheus + Grafana.
 
 ## Tasks
 
-- [ ] 1. Monorepo directory scaffold and shared Kafka envelope schema
-  - [ ] 1.1 Create the top-level directory structure
-    - Create `services/ingest/`, `services/dispatch/`, `services/notification/`, `services/tracking/`, `services/gateway/`
-    - Create `infra/docker/`, `infra/k8s/`, `infra/kafka/`
-    - Create `scripts/`
-    - Create `shared/` with a `README.md` stating it is restricted to infrastructure concerns only (envelope schema, health check DTOs, common error shapes — no domain aggregates)
-    - Create placeholder `docker-compose.yml` at the repository root (to be filled in Task 8)
-    - Create `.env.example` at the repository root with placeholder entries for every environment variable referenced in the design (Kafka bootstrap, SASL credentials per service, PostgreSQL credentials, Redis password, service ports); add `.env` to `.gitignore`
-    - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.7, 10.1, 10.2_
+- [ ] 1. Monorepo scaffold, shared Avro schemas, and envelope types
+  - [ ] 1.1 Create top-level directory structure and root configuration files
+    - Create `services/ingest/`, `services/dispatch/`, `services/notification/`, `services/tracking/`, `services/gateway/` directories
+    - Create `infra/docker/`, `infra/k8s/`, `infra/kafka/`, `infra/terraform/` directories
+    - Create `scripts/`, `shared/avro/`, `shared/envelope/`, `shared/proto/`, `docs/adr/`, `docs/query-plans/` directories
+    - Create root `.env.example` documenting every required environment variable with placeholder values and inline comments; ensure `.env` is listed in `.gitignore`
+    - Create root `Makefile` with targets: `build`, `test`, `lint`, `up`, `down`
+    - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 10.1, 10.2_
 
-  - [ ] 1.2 Define the shared Kafka Domain Event envelope schema
-    - Create `shared/envelope.py`: implement the `DomainEventEnvelope` frozen dataclass (`event_id`, `event_type`, `occurred_at`, `payload: dict`) and the `validate_envelope(raw: dict) -> DomainEventEnvelope` function that raises `EnvelopeValidationError` with a descriptive message identifying the failing field; it validates envelope structure only — not payload contents
-    - Create `shared/KafkaEnvelope.java`: implement the Java `record KafkaEnvelope(String eventId, String eventType, String occurredAt, Map<String,Object> payload)` with a static `KafkaEnvelope.of(String eventType, Map<String,Object> payload)` convenience factory that generates `eventId` (UUID4) and `occurredAt` (ISO 8601); annotate with a comment that services should prefer `EventEnvelopeFactory` for domain event construction
-    - Create `shared/envelope_schema.json` as a JSON Schema document describing the envelope for cross-language reference
-    - Document the envelope fields, the `event_id` immutability rule, and the constraint that `shared/` MUST NOT contain `Trip`, `DriverLocation`, `Notification`, or any other domain aggregate in `shared/README.md`
-    - _Requirements: 1.4, 2.2, 3.3, 3.4_
+  - [ ] 1.2 Write Avro schemas for all Domain Events in `shared/avro/`
+    - Write `shared/avro/location_ping_received.avsc` — envelope fields `event_id`, `event_type`, `occurred_at`, `payload` (with `driver_id`, `latitude`, `longitude`, `timestamp`)
+    - Write `shared/avro/trip_requested.avsc` — envelope + payload (`trip_id`, `rider_id`, `pickup_location`, `requested_at`)
+    - Write `shared/avro/trip_assigned.avsc` — envelope + payload (`trip_id`, `driver_id`, `rider_id`, `assigned_at`)
+    - Write `shared/avro/trip_cancelled.avsc` — envelope + payload (`trip_id`, `reason`, `cancelled_at`); modelled in Phase 1, not triggered
+    - All schemas must use the standard envelope structure; `event_type` is part of the schema contract (not a Kafka header)
+    - _Requirements: 1.4, 2.2, 3.3, 3.17_
 
-- [ ] 2. FastAPI Ingest Service
-  - [ ] 2.1 Scaffold the Ingest Service project structure
-    - Create `services/ingest/` with the full module structure from the LLD: `main.py`, `config.py`, `models.py`, `kafka_producer.py`, `events.py`, `routers/location.py`, `routers/health.py`, `tests/test_location_endpoint.py`, `tests/test_kafka_producer.py`
-    - In `config.py`: implement `Settings(BaseSettings)` using `pydantic-settings`; declare all required fields (`kafka_bootstrap_servers`, `kafka_topic_gps_pings`, `kafka_sasl_username`, `kafka_sasl_password`, `service_port: int = 8001`) — `ValidationError` is raised at import time if any required variable is absent, so the service never starts with missing configuration (Settings Object / 12-Factor pattern)
-    - In `main.py`: implement the FastAPI app factory with a lifespan context manager; register routes from `routers/location.py` and `routers/health.py`; apply `MaxBodySizeMiddleware` at the app level (not inline in handlers)
-    - In `routers/health.py`: implement `GET /health` returning `{"status": "ok"}`
-    - Create `requirements.txt` with pinned versions: `fastapi`, `uvicorn`, `confluent-kafka`, `pydantic`, `pydantic-settings`, `hypothesis`
-    - `Dockerfile` MUST use `python:3.11.9-slim` as the base image, create a non-root user `appuser`, and run the process as that user
-    - _Requirements: 2.8, 2.11, 10.6, 10.7, 10.10_
+  - [ ] 1.3 Implement Go shared envelope package (`shared/envelope/envelope.go`)
+    - Define `DomainEventEnvelope` struct with `avro` struct tags: `EventID`, `EventType`, `OccurredAt`, `Payload map[string]interface{}`
+    - Implement `Validate(e DomainEventEnvelope) error` — checks `EventID` is a non-empty UUID string and `EventType` is non-empty; returns `EnvelopeValidationError` identifying the failing field
+    - Do NOT place any domain types (`Trip`, `DriverLocation`, `Notification`) in `shared/`
+    - _Requirements: 1.4_
 
-  - [ ] 2.2 Implement `models.py`, `MaxBodySizeMiddleware`, and the `POST /location` route handler
-    - In `models.py`: implement `GpsPingRequest` Pydantic model with `driver_id` (non-empty string, max 128 chars), `latitude` (float, −90 to 90), `longitude` (float, −180 to 180), `timestamp` (ISO 8601 string); implement `LocationAcceptedResponse` Pydantic model with `message_id: str`
-    - Return HTTP 422 with a structured error body for missing fields, out-of-range coordinates, empty `driver_id`, or `driver_id` exceeding 128 characters
-    - Implement `MaxBodySizeMiddleware` as a Starlette `BaseHTTPMiddleware` subclass in `main.py`; apply it at the app level so the 64 KB limit is enforced before any route handler is reached; return HTTP 413 if exceeded
-    - In `routers/location.py`: implement `ingest_location(ping: GpsPingRequest, producer: KafkaProducerClient = Depends(get_producer)) -> LocationAcceptedResponse` — the handler declares `KafkaProducerClient` as a parameter resolved via FastAPI `Depends()`; it is never instantiated inside the handler body (Dependency Injection pattern)
-    - _Requirements: 2.1, 2.4, 2.5, 2.10, 10.8, 10.9_
+  - [ ] 1.4 Implement Java shared envelope type (`shared/KafkaEnvelope.java`)
+    - Define `KafkaEnvelope` as a Java `record` with fields: `eventId`, `eventType`, `occurredAt`, `payload Map<String,Object>`
+    - Implement static factory `KafkaEnvelope.of(String eventType, Map<String,Object> payload)` that generates `eventId` (UUID4) and `occurredAt` (ISO 8601)
+    - Add Javadoc noting this factory is for infrastructure-level use only; service-specific domain events use `EventEnvelopeFactory`
+    - _Requirements: 1.4_
 
-  - [ ] 2.3 Implement `events.py`, `kafka_producer.py`, and wire Kafka publishing in the route handler
-    - In `events.py`: implement the `DomainEvent` frozen dataclass (`event_id: str`, `event_type: str`, `occurred_at: str`, `payload: dict`); implement `build_location_ping_event(ping: GpsPingRequest) -> DomainEvent` — this pure factory function generates `event_id` (UUID4) and `occurred_at` (utcnow ISO 8601) internally, copies `driver_id`, `latitude`, `longitude`, `timestamp` from `ping` into `payload`; UUID and timestamp generation are isolated here to keep the function straightforward to test with Hypothesis (Factory Function pattern)
-    - In `kafka_producer.py`: implement `KafkaProducerClient` with `__init__(self, settings: Settings)` that initialises the `confluent-kafka` Producer with `enable.idempotence=true` and SASL/PLAIN credentials; implement `publish(self, topic: str, key: str, event: DomainEvent) -> str` that serialises the event to JSON, calls `producer.produce()`, flushes, and returns `event_id` on success — raises `KafkaPublishError` on delivery failure (Result type / exception pattern; no sentinel return values)
-    - In `routers/location.py`: complete `ingest_location()` — call `build_location_ping_event(ping)`, call `producer.publish(topic, key=ping.driver_id, event)`, return `202 LocationAcceptedResponse(message_id=event.event_id)`; catch `KafkaPublishError` and raise `HTTPException(503)` with a log warning including the broker address
-    - On valid request: generate a UUID `event_id`, build the `LocationPingReceived` envelope, publish to `gps-pings` with `driver_id` as the message key; return HTTP 202 `{"message_id": "<event_id>"}` on successful publish; return HTTP 503 if the topic is unavailable
-    - _Requirements: 2.2, 2.3, 2.6, 2.9_
 
-  - [ ]* 2.4 Write property tests for the Ingest Service (Hypothesis) in `tests/test_location_endpoint.py`
-    - **Property 1: GPS ping event envelope round-trip** — generate random valid `driver_id` (1–128 chars), `latitude` in [−90, 90], `longitude` in [−180, 180], ISO 8601 `timestamp`; assert HTTP 202 and that `message_id` equals the `event_id` in the captured Kafka message, with correct `event_type` and preserved payload fields. Mock `KafkaProducerClient.publish()` via `unittest.mock`.
-    - **Property 2: Ingest Service rejects invalid GPS ping inputs** — generate requests with at least one invalid condition (missing field, out-of-range coordinate, empty `driver_id`, `driver_id` > 128 chars); assert HTTP 422 and that `KafkaProducerClient.publish()` is never called.
-    - **Property 5 (Ingest side): HTTP request body size enforcement** — generate payloads whose byte size straddles the 64 KB boundary; assert HTTP 413 for oversized payloads and normal processing for valid-sized payloads; verify `MaxBodySizeMiddleware` intercepts before the handler.
-    - Tag each test with `# Feature: e2e-skeleton, Property N: <title>`; run minimum 100 iterations per property
-    - _Requirements: 2.1, 2.2, 2.4, 2.5, 2.6, 2.10_
+- [ ] 2. Go Ingest Service
+  - [ ] 2.1 Scaffold Ingest Service module structure and config
+    - Initialise Go module at `services/ingest/` (`go mod init`)
+    - Add dependencies: `github.com/go-chi/chi/v5`, `github.com/confluentinc/confluent-kafka-go/v2`, `github.com/go-playground/validator/v10`, `github.com/google/uuid`, `go.opentelemetry.io/otel`, `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`, `pgregory.net/rapid` (test-only)
+    - Implement `config/config.go`: `Config` struct with fields `KafkaBootstrapServers`, `KafkaTopic`, `KafkaSASLUsername`, `KafkaSASLPassword`, `SchemaRegistryURL`, `ServicePort`, `OTELEndpoint`; implement `LoadConfig()` reading each via `os.Getenv`; log descriptive error identifying the missing variable and call `os.Exit(1)` if any required var is absent
+    - _Requirements: 2.8, 10.10_
 
-  - [ ] 2.5 Generate and commit the Ingest Service OpenAPI spec
-    - Configure FastAPI to auto-generate the OpenAPI spec at application startup
-    - Add a startup hook in `main.py` lifespan that writes the spec to `services/ingest/openapi.json`
-    - Verify the spec includes the `POST /location` request schema (`GpsPingRequest`), all response codes (202, 413, 422, 503), and the `GET /health` endpoint
-    - _Requirements: 2.7, 8.1, 8.4, 8.6_
+  - [ ] 2.2 Implement Ingest Service domain model and event factory
+    - Implement `model/gps_ping.go`: `GpsPingRequest` struct with `go-playground/validator` tags — `DriverID` (required, max=128), `Latitude` (required, min=-90, max=90), `Longitude` (required, min=-180, max=180), `Timestamp` (required)
+    - Implement `events/location_ping.go`: `DomainEvent` struct; `BuildLocationPingEvent(ping model.GpsPingRequest) DomainEvent` factory — generates `EventID` (UUID4 via `github.com/google/uuid`), sets `EventType = "LocationPingReceived"`, sets `OccurredAt` to `time.Now().UTC()` ISO 8601, copies all ping fields into `Payload`; never returns an error
+    - _Requirements: 2.1, 2.2_
+
+  - [ ] 2.3 Implement Ingest Service Kafka producer (`kafka/producer.go`)
+    - Implement `Producer` struct with fields `producer *confluent.Producer`, `schemaRegistryURL string`, `topic string`
+    - Implement `NewProducer(cfg config.Config) (*Producer, error)` — configure with `acks=all`, `enable.idempotence=true`, SASL/PLAIN credentials from config
+    - Implement `Publish(key string, event events.DomainEvent) (string, error)` — serialise event as Avro via Schema Registry client (register schema from `shared/avro/location_ping_received.avsc` on first publish), call `producer.Produce()`, flush; return `event_id` on success; return error on delivery failure (caller returns HTTP 503); inject `traceparent` W3C header into Kafka message headers
+    - _Requirements: 2.2, 2.3, 2.9, 12.1_
+
+  - [ ] 2.4 Implement Ingest Service HTTP handlers and middleware
+    - Implement `middleware/body_size.go`: `MaxBodySize(limit int64) func(http.Handler) http.Handler` — standard Go middleware that returns HTTP 413 if request body exceeds `limit` bytes before the handler is called; limit is 65536 (64 KB)
+    - Implement `handler/health.go`: `GET /health` handler returning `200 {"status": "ok"}`
+    - Implement `handler/location.go`: `LocationHandler` struct with `Producer *kafka.Producer` field (constructor injection — never instantiate producer inside handler body); `ServeHTTP` method: decode JSON → `GpsPingRequest`, validate struct tags (return 422 with structured error body on failure), call `BuildLocationPingEvent`, call `Producer.Publish(key=driver_id, event)`, return `202 {"message_id": event_id}` on success or `503` on Kafka error
+    - _Requirements: 2.1, 2.3, 2.4, 2.5, 2.6, 2.10, 10.8, 10.9_
+
+  - [ ] 2.5 Implement Ingest Service main entrypoint with OTel and metrics
+    - Implement `main.go`: initialise OTel tracer (OTLP exporter to `OTEL_EXPORTER_OTLP_ENDPOINT`), call `config.LoadConfig()`, construct `kafka.NewProducer(cfg)`, construct `LocationHandler{Producer: p}`, build `chi` router with middleware chain (`MaxBodySize(65536)` → `otelhttp.NewHandler` → routes), register `GET /health` and `GET /metrics` (Prometheus text format) routes, start HTTP server on `cfg.ServicePort`, implement graceful shutdown on SIGTERM/SIGINT
+    - _Requirements: 2.8, 2.12, 12.1, 12.2, 12.3_
+
+  - [ ] 2.6 Write Ingest Service Dockerfile
+    - Write `infra/docker/ingest.Dockerfile` (or `services/ingest/Dockerfile`): multi-stage build — `FROM golang:1.22-alpine AS builder` compiles static binary with `CGO_ENABLED=0`; `FROM gcr.io/distroless/static-debian12` final stage copies only the binary; add `USER nonroot:nonroot` directive; use pinned digest versions, never `latest`
+    - _Requirements: 2.11, 10.6, 10.7_
+
+  - [ ]* 2.7 Write property test for GPS ping event envelope round-trip (Property 1)
+    - File: `services/ingest/tests/location_handler_test.go`
+    - `// Feature: e2e-skeleton, Property 1: GPS ping event envelope round-trip`
+    - Use `pgregory.net/rapid` to generate: `driver_id` (1–128 chars), `latitude` in [−90, 90], `longitude` in [−180, 180], ISO 8601 `timestamp`
+    - Assert: `message_id` in HTTP 202 response equals `event_id` in the Kafka message captured by mock producer; Kafka message has `event_type = "LocationPingReceived"`; payload preserves all four input fields exactly
+    - Mock the Kafka producer using confluent-kafka-go mock producer; minimum 100 iterations
+    - **Property 1: GPS ping event envelope round-trip**
+    - **Validates: Requirements 2.2, 2.6**
+
+  - [ ]* 2.8 Write property test for Ingest Service invalid input rejection (Property 2)
+    - File: `services/ingest/tests/location_handler_test.go`
+    - `// Feature: e2e-skeleton, Property 2: Ingest Service rejects invalid GPS ping inputs`
+    - Use `pgregory.net/rapid` to generate requests with: missing required fields, `latitude` outside [−90, 90], `longitude` outside [−180, 180], empty `driver_id`, `driver_id` > 128 chars
+    - Assert: service returns HTTP 422 for all invalid inputs; mock producer `Publish` is never called
+    - **Property 2: Ingest Service rejects invalid GPS ping inputs**
+    - **Validates: Requirements 2.4, 2.5, 10.9**
+
+  - [ ]* 2.9 Write property test for 64 KB body size enforcement on Ingest Service (Property 5)
+    - File: `services/ingest/tests/location_handler_test.go`
+    - `// Feature: e2e-skeleton, Property 5: HTTP request body size enforcement`
+    - Use `pgregory.net/rapid` to generate payloads of varying byte sizes around the 64 KB boundary (e.g., 65535, 65536, 65537, random sizes up to 128 KB)
+    - Assert: bodies > 65536 bytes return HTTP 413; bodies ≤ 65536 bytes that are otherwise valid return HTTP 202
+    - **Property 5: HTTP request body size enforcement**
+    - **Validates: Requirements 2.10, 10.8**
+
 
 - [ ] 3. Spring Boot Dispatch Service
-  - [ ] 3.1 Scaffold the Dispatch Service project structure
-    - Create `services/dispatch/` with the full package structure from the LLD: `com.dispatch/DispatchApplication.java`, `config/AppConfig.java`, `config/KafkaConsumerConfig.java`, `domain/Trip.java`, `domain/TripStatus.java`, `domain/TripRepository.java`, `events/DomainEventEnvelope.java`, `events/TripRequestedPayload.java`, `events/TripAssignedPayload.java`, `events/TripCancelledPayload.java`, `events/EventEnvelopeFactory.java`, `service/DispatchService.java`, `service/DriverRegistry.java`, `service/DriverSelectionStrategy.java`, `service/HardcodedDriverSelectionStrategy.java`, `consumer/RideEventsConsumer.java`, `consumer/LocationPingConsumer.java`, `consumer/EnvelopeValidator.java`, `web/RideController.java`, `web/HealthController.java`, `web/dto/RequestRideRequest.java`, `web/dto/RequestRideResponse.java`, `web/dto/PickupLocation.java`
-    - Create Maven `pom.xml` with Spring Boot 3.x, Spring Kafka, Spring Data JPA, springdoc-openapi, jqwik, H2 for tests, PostgreSQL driver; all dependency versions pinned
-    - In `config/AppConfig.java`: implement `@PostConstruct validateRequiredEnvVars()` that iterates a list of required environment variable names (`KAFKA_BOOTSTRAP_SERVERS`, `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD`, `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD`) and throws `IllegalStateException` with the missing variable name if any are absent — this runs before the application context finishes starting (Fail-fast `@PostConstruct` pattern)
-    - `Dockerfile` MUST use `eclipse-temurin:21-jre-jammy` as the base image, create a non-root user `appuser`, and run the process as that user
-    - Implement exponential backoff retry on Kafka broker connection at startup (up to 5 attempts, then exit non-zero)
-    - _Requirements: 3.5, 3.6, 3.12, 10.6, 10.7, 10.10_
-
-  - [ ] 3.2 Define the PostgreSQL `trips` table, `Trip` entity, `TripStatus` state machine, and `TripRepository`
-    - Create the `trips` table schema via Flyway or Liquibase migration: `trip_id` (UUID PK), `rider_id` (VARCHAR 128), `driver_id` (VARCHAR 128, nullable), `status` (VARCHAR 20: `REQUESTED`, `ASSIGNED`, `CANCELLED`), `pickup_lat`, `pickup_lng`, `requested_at`, `assigned_at` (nullable), `updated_at`; create indexes `idx_trips_status` and `idx_trips_updated_at`
-    - In `domain/Trip.java`: implement the `@Entity` class with all fields matching the schema
-    - In `domain/TripStatus.java`: implement the enum `REQUESTED`, `ASSIGNED`, `CANCELLED` with a `VALID_TRANSITIONS` map and `assertCanTransitionTo(TripStatus next)` guard method that throws `IllegalStateTransitionException` if the transition is not in the map — invalid transitions are impossible to reach without an explicit exception (State Machine with guard pattern)
-    - In `domain/TripRepository.java`: implement `JpaRepository<Trip, UUID>`
-    - In `events/TripCancelledPayload.java`: model the `TripCancelled` domain event record (`tripId`, `reason`, `cancelledAt`) — not triggered in Phase 1 but modelled in code so the compensating event exists in the domain model before Phase 2
+  - [ ] 3.1 Scaffold Dispatch Service project structure and domain model
+    - Initialise Spring Boot 3.x project at `services/dispatch/` with dependencies: `spring-boot-starter-web`, `spring-boot-starter-data-jpa`, `spring-kafka`, `io.confluent:kafka-avro-serializer`, `springdoc-openapi-starter-webmvc-ui`, `flyway-core`, `postgresql`, `opentelemetry-spring-boot-starter`, `jqwik` (test-only)
+    - Implement `domain/TripStatus.java` enum: `REQUESTED`, `ASSIGNED`, `CANCELLED`; implement `assertCanTransitionTo(TripStatus next)` guard method using `VALID_TRANSITIONS` map; throw `IllegalStateTransitionException(this, next)` on invalid transition
+    - Implement `domain/Trip.java` `@Entity`: fields `tripId` (UUID PK), `riderId` (VARCHAR 128), `driverId` (VARCHAR 128, nullable), `status` (VARCHAR 20), `pickupLat`, `pickupLng` (DOUBLE PRECISION), `requestedAt`, `assignedAt` (nullable), `updatedAt` (TIMESTAMPTZ DEFAULT now())
+    - Implement `domain/TripRepository.java` extending `JpaRepository<Trip, UUID>`
+    - Write Flyway migration `V1__create_trips_table.sql` in `src/main/resources/db/migration/`: CREATE TABLE trips + `idx_trips_status` + `idx_trips_updated_at` indexes; commit `EXPLAIN ANALYZE` output to `docs/query-plans/V1_trips_indexes.md`
     - _Requirements: 3.16, 3.17_
 
-  - [ ] 3.3 Implement `EventEnvelopeFactory`, `DriverSelectionStrategy`, and the `POST /request-ride` HTTP endpoint
-    - In `events/EventEnvelopeFactory.java`: implement static factory methods `buildTripRequested(UUID tripId, String riderId, PickupLocation pickup, Instant requestedAt)` and `buildTripAssigned(UUID tripId, String driverId, String riderId, Instant assignedAt)` — all UUID generation (`eventId`) and timestamp generation (`occurredAt`) are isolated here; `DispatchService` never calls `UUID.randomUUID()` directly (Factory pattern)
-    - In `service/DriverSelectionStrategy.java`: define the interface `selectDriver(PickupLocation pickup) -> String`
-    - In `service/HardcodedDriverSelectionStrategy.java`: implement `DriverSelectionStrategy` with a static `DRIVERS` list (`driver-001`, `driver-002`, `driver-003`) and an `AtomicInteger` counter for round-robin selection; `DispatchService` depends on the interface, not the concrete class (Strategy pattern stub)
-    - In `service/DispatchService.java`: implement `@Transactional requestRide(String riderId, PickupLocation pickup) -> UUID` — generates `tripId`, persists `Trip(status=REQUESTED)`, calls `EventEnvelopeFactory.buildTripRequested()`, publishes to `ride-events`, returns `tripId`; implement `@Transactional assignDriver(UUID tripId, String riderId)` — loads `Trip`, calls `status.assertCanTransitionTo(ASSIGNED)`, calls `driverSelectionStrategy.selectDriver(pickup)`, updates `Trip(status=ASSIGNED, driverId, assignedAt)`, calls `EventEnvelopeFactory.buildTripAssigned()`, publishes to `ride-events`
-    - In `web/RideController.java`: implement `POST /request-ride` accepting `@Valid RequestRideRequest` (with `rider_id` non-empty max 128 chars, `pickup_location`); return HTTP 422 for invalid input; enforce 64 KB maximum request body size returning HTTP 413 if exceeded; delegate to `dispatchService.requestRide()`; return HTTP 202 `{"trip_id": "<uuid>"}`
-    - In `web/HealthController.java`: implement `GET /health` returning `{"status": "UP"}` and expose `GET /v3/api-docs` via springdoc-openapi
-    - _Requirements: 3.4, 3.8, 3.10, 3.11, 10.8, 10.9_
+  - [ ] 3.2 Implement Dispatch Service configuration and fail-fast startup
+    - Implement `config/AppConfig.java` `@Configuration`: `@PostConstruct validateRequiredEnvVars()` iterates required env var names (`KAFKA_BOOTSTRAP_SERVERS`, `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD`, `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD`, `SCHEMA_REGISTRY_URL`, `SERVICE_PORT`, `OTEL_EXPORTER_OTLP_ENDPOINT`) and throws `IllegalStateException` with the missing variable name if any are absent
+    - Implement `config/KafkaConsumerConfig.java`: consumer factory beans for `ride-events` (`dispatch-consumer-group`) and `gps-pings` (`dispatch-location-group`); configure Avro deserialiser with Schema Registry URL; configure exponential backoff retry (up to 5 attempts) on startup connection failure
+    - _Requirements: 3.5, 3.6, 10.10_
 
-  - [ ] 3.4 Implement `RideEventsConsumer` (dispatch-consumer-group) and `EnvelopeValidator`
-    - In `consumer/EnvelopeValidator.java`: implement the stateless `public static void validate(DomainEventEnvelope envelope)` method that asserts `eventId` is a non-empty UUID string and `eventType` is non-null/non-empty; throws `EnvelopeValidationException` with a descriptive message on failure — independently testable, not inlined in the consumer
-    - In `consumer/RideEventsConsumer.java`: implement `@KafkaListener(topics = "${kafka.topic.ride-events}", groupId = "${kafka.consumer.group.ride-events}")` on `onMessage(ConsumerRecord<String, String> record)`; deserialise to `DomainEventEnvelope`; filter for `event_type == "TripRequested"` — acknowledge and skip all other event types; delegate to `dispatchService.assignDriver(tripId, riderId)`; complete dispatch and publish within 2 seconds of consumption; log a WARNING if exceeded
-    - _Requirements: 3.1, 3.2, 3.3, 3.7, 3.16_
+  - [ ] 3.3 Implement Dispatch Service domain events and factory
+    - Implement `events/DomainEventEnvelope.java` record: `eventId`, `eventType`, `occurredAt`, `payload Map<String,Object>`
+    - Implement `events/TripRequestedPayload.java`, `TripAssignedPayload.java`, `TripCancelledPayload.java` records with all required fields
+    - Implement `events/EventEnvelopeFactory.java` static factory: `buildTripRequested(UUID tripId, String riderId, PickupLocation pickup, Instant requestedAt)` and `buildTripAssigned(UUID tripId, String driverId, String riderId, Instant assignedAt)` — all UUID generation and timestamp generation isolated here; `DispatchService` never calls `UUID.randomUUID()` directly
+    - _Requirements: 3.3, 3.4_
 
-  - [ ] 3.5 Implement `LocationPingConsumer` (dispatch-location-group)
-    - In `consumer/LocationPingConsumer.java`: implement `@KafkaListener(topics = "${kafka.topic.gps-pings}", groupId = "${kafka.consumer.group.gps-pings}")` on `onMessage(ConsumerRecord<String, String> record)` using consumer group `dispatch-location-group` (separate from `dispatch-consumer-group`)
-    - Call `EnvelopeValidator.validate(envelope)` to assert `event_type == "LocationPingReceived"` and `event_id` is a non-empty UUID; log at DEBUG level on success
-    - On deserialization failure or `EnvelopeValidationException`: log WARNING to stderr, commit offset, continue without crashing
-    - Do NOT write to Redis in Phase 1 (CQRS read model stub per ADR 005)
-    - _Requirements: 3.13, 3.14, 3.15_
+  - [ ] 3.4 Implement Dispatch Service driver selection strategy and service layer
+    - Implement `service/DriverSelectionStrategy.java` interface: `String selectDriver(PickupLocation pickup)`
+    - Implement `service/HardcodedDriverSelectionStrategy.java` `@Component`: static list `["driver-001", "driver-002", "driver-003"]`; round-robin via `AtomicInteger`; ignores `pickup` in Phase 1
+    - Implement `service/DispatchService.java` `@Service`: `@Transactional requestRide(String riderId, PickupLocation pickup)` — generate `tripId`, persist `Trip(status=REQUESTED)`, build `TripRequested` envelope via `EventEnvelopeFactory`, publish to `ride-events`, return `tripId`; `@Transactional assignDriver(UUID tripId, String riderId)` — load Trip, call `status.assertCanTransitionTo(ASSIGNED)`, call `driverSelectionStrategy.selectDriver(pickup)`, update Trip, build `TripAssigned` envelope, publish to `ride-events`; Kafka producer configured with `acks=all`, `enable.idempotence=true`
+    - _Requirements: 3.1, 3.2, 3.3, 3.7, 3.10_
 
-  - [ ]* 3.6 Write property tests for the Dispatch Service (jqwik)
-    - **Property 3: TripAssigned envelope correctness** — generate random `trip_id` UUIDs, `rider_id` strings (1–128 chars), valid `pickup_location` coordinates; assert the resulting `TripAssigned` event built by `EventEnvelopeFactory.buildTripAssigned()` has a non-empty `event_id` UUID, `event_type = "TripAssigned"`, valid ISO 8601 `occurred_at`, same `trip_id`, non-empty `driver_id` from `HardcodedDriverSelectionStrategy.DRIVERS`, same `rider_id`, valid ISO 8601 `assigned_at`. Mock `KafkaTemplate` and PostgreSQL.
-    - **Property 4: Dispatch event type filtering** — generate random `event_type` strings excluding `"TripRequested"`; assert `dispatchService.assignDriver()` is never called and no `TripAssigned` event is published by `RideEventsConsumer`.
-    - **Property 5 (Dispatch side): HTTP request body size enforcement** — generate payloads straddling the 64 KB boundary for `POST /request-ride`; assert HTTP 413 for oversized payloads.
-    - **Property 6: gps-pings envelope validation** — generate valid envelopes, envelopes with missing `event_id`, wrong `event_type`, and non-JSON bytes; assert `EnvelopeValidator.validate()` throws `EnvelopeValidationException` and WARNING is logged for invalid inputs; assert DEBUG log for valid inputs; assert `LocationPingConsumer` continues without crashing in all cases.
-    - **Property 9: Trip state machine persistence round-trip** — generate random `rider_id` and `pickup_location`; assert `trips` table contains `status = REQUESTED` after `POST /request-ride` returns 202, then `status = ASSIGNED` with non-null `driver_id` and `assigned_at` after `TripAssigned` is published; verify `TripStatus.assertCanTransitionTo()` is exercised. Use H2 in-memory DB.
-    - **Property 12: Startup fails fast on missing environment variables** — omit each required env var in turn from `AppConfig.validateRequiredEnvVars()`; assert non-zero exit and descriptive error log identifying the missing variable.
-    - Tag each test with `// Feature: e2e-skeleton, Property N: <title>`; run minimum 100 iterations per property
-    - _Requirements: 3.1, 3.3, 3.11, 3.13, 3.14, 3.15, 3.16, 10.10_
+  - [ ] 3.5 Implement Dispatch Service Kafka consumers
+    - Implement `consumer/EnvelopeValidator.java` stateless validator: `static void validate(DomainEventEnvelope envelope)` — asserts `eventId` is non-empty UUID string and `eventType` is non-null/non-empty; throws `EnvelopeValidationException` with descriptive message on failure
+    - Implement `consumer/RideEventsConsumer.java` `@KafkaListener` on `ride-events` topic, group `dispatch-consumer-group`: deserialise Avro → `DomainEventEnvelope`; filter `event_type == "TripRequested"` only; delegate to `dispatchService.assignDriver(tripId, riderId)`; must complete within 2 seconds; propagate W3C `traceparent` header from Kafka message headers to OTel span context
+    - Implement `consumer/LocationPingConsumer.java` `@KafkaListener` on `gps-pings` topic, group `dispatch-location-group`: call `EnvelopeValidator.validate()`; log receipt at DEBUG level; on deserialisation failure or envelope validation failure: log WARNING to stderr, commit offset, continue; do NOT write to Redis in Phase 1
+    - _Requirements: 3.1, 3.13, 3.14, 3.15, 12.1_
 
-  - [ ] 3.7 Generate and commit the Dispatch Service OpenAPI spec
-    - Verify springdoc-openapi exposes `/v3/api-docs` with the `POST /request-ride` endpoint, `RequestRideRequest` schema, and all response codes (202, 413, 422)
-    - Add a script or Maven goal that fetches `/v3/api-docs` and writes the output to `services/dispatch/openapi.json`
-    - _Requirements: 3.8, 3.9, 8.3, 8.4, 8.6_
+  - [ ] 3.6 Implement Dispatch Service HTTP layer and OpenAPI
+    - Implement `web/dto/PickupLocation.java`, `RequestRideRequest.java` (record with `@Valid` annotations: `riderId` non-empty max 128, `pickupLocation` non-null), `RequestRideResponse.java` (record: `tripId UUID`)
+    - Implement `web/RideController.java` `@RestController`: `POST /request-ride` — `@Valid` request body, enforce 64 KB body size limit (Spring `spring.servlet.multipart.max-request-size` or `@RequestBody` size filter), delegate to `dispatchService.requestRide()`, return `202 {"trip_id": tripId}`; return 413 for oversized body, 422 for validation failure
+    - Implement `web/HealthController.java`: `GET /health` returning `200 {"status": "UP"}`
+    - Configure `springdoc-openapi` to expose `/v3/api-docs`; auto-generate `services/dispatch/openapi.json` on startup
+    - _Requirements: 3.4, 3.8, 3.9, 3.11, 10.8, 10.9_
 
-- [ ] 4. Checkpoint — Ingest and Dispatch unit tests pass
-  - Ensure all unit and property tests for the Ingest Service and Dispatch Service pass. Ask the user if questions arise.
+  - [ ] 3.7 Write Dispatch Service Dockerfile
+    - Write `infra/docker/dispatch.Dockerfile` (or `services/dispatch/Dockerfile`): `FROM eclipse-temurin:21-jre-jammy` (pinned version); add `RUN groupadd -r appuser && useradd -r -g appuser appuser`; `USER appuser`; copy JAR; `ENTRYPOINT ["java", "-jar", "app.jar"]`
+    - _Requirements: 3.12, 10.6, 10.7_
 
-- [ ] 5. FastAPI Notification Service
-  - [ ] 5.1 Scaffold the Notification Service project structure
-    - Create `services/notification/` with the full module structure from the LLD: `main.py`, `config.py`, `consumer.py`, `handlers.py`, `events.py`, `logger.py`, `routers/health.py`, `tests/test_notification_consumer.py`
-    - In `config.py`: implement `Settings(BaseSettings)` using `pydantic-settings`; declare all required fields (`kafka_bootstrap_servers`, `kafka_topic_ride_events`, `kafka_sasl_username`, `kafka_sasl_password`, `kafka_consumer_group_id`, `service_port`) — `ValidationError` raised at import time on missing vars (Settings Object / 12-Factor pattern)
-    - In `main.py`: implement the FastAPI app factory with a lifespan context manager that starts `KafkaConsumerWorker` in a background thread on startup and calls `worker.stop()` on shutdown; register `routers/health.py`
-    - In `routers/health.py`: implement `GET /health` returning `{"status": "ok"}`
-    - Create `requirements.txt` with pinned versions: `fastapi`, `uvicorn`, `confluent-kafka`, `pydantic`, `pydantic-settings`, `hypothesis`
-    - `Dockerfile` MUST use `python:3.11.9-slim`, create non-root user `appuser`, run as that user
-    - _Requirements: 4.6, 4.7, 4.9, 10.6, 10.7, 10.10_
+  - [ ]* 3.8 Write property test for TripAssigned envelope correctness (Property 3)
+    - File: `services/dispatch/src/test/java/TripAssignedProducerTest.java`
+    - `// Feature: e2e-skeleton, Property 3: TripAssigned event envelope correctness`
+    - Use `jqwik` `@Property` to generate: random `trip_id` UUIDs, `rider_id` strings (1–128 chars), valid `pickup_location` coordinates
+    - Assert: resulting `TripAssigned` event has non-empty `event_id` UUID, `event_type = "TripAssigned"`, valid ISO 8601 `occurred_at`, payload `trip_id` matches input, `driver_id` is from the static driver list, `rider_id` matches input, `assigned_at` is valid ISO 8601
+    - Mock Kafka producer with Mockito; minimum 100 iterations
+    - **Property 3: TripAssigned event envelope correctness**
+    - **Validates: Requirements 3.3**
 
-  - [ ] 5.2 Implement `events.py`, `logger.py`, `handlers.py`, and `consumer.py`
-    - In `events.py`: implement `TripAssignedEvent` as a `@dataclass(frozen=True)` with fields `event_id`, `event_type`, `trip_id`, `driver_id`, `rider_id`, `assigned_at`; implement `parse_trip_assigned(envelope: dict) -> TripAssignedEvent` that validates all required fields and raises `EventParseError` (with field name) if any are absent or empty — never returns a partially-constructed event (Frozen dataclass pattern)
-    - In `logger.py`: implement `NotificationLogger` class with `log_notification(self, event: TripAssignedEvent) -> None` that emits one JSON log line to stdout with all required fields plus `notification_sent_at` (utcnow ISO 8601), and `log_warning(self, message: str, **context) -> None` that emits a JSON warning line to stderr; implement `get_structured_logger() -> NotificationLogger` that configures stdlib logging for JSON stdout output (Structured logging adapter pattern)
-    - In `handlers.py`: implement `handle_trip_assigned(event: TripAssignedEvent, logger: NotificationLogger) -> None` that calls `logger.log_notification(event)` — never calls `print()` or raw `logging.info()` directly; implement `skip_handler(event: object) -> None` as a no-op callable for all non-`TripAssigned` event types (Null Object pattern)
-    - In `consumer.py`: implement `KafkaConsumerWorker` with `__init__(self, settings: Settings, handlers: dict[str, Callable])` accepting a handler registry keyed by `event_type`; implement `start(self) -> None` that starts `_run()` in a daemon background thread; implement `stop(self) -> None` that sets the stop flag and waits for the thread; implement `_run(self) -> None` as the consumer loop — `poll()` → deserialise JSON → extract `event_type` → call `handlers.get(event_type, skip_handler)(parsed_event)` → commit offset; on JSON deserialisation failure: log WARNING via `NotificationLogger.log_warning()` with raw message bytes, commit offset, continue (Observer / Handler dispatch pattern)
-    - Wire the handler registry in `main.py`: `{"TripAssigned": handle_trip_assigned}` passed to `KafkaConsumerWorker`
-    - Consume from `ride-events` using consumer group from `KAFKA_CONSUMER_GROUP_ID` (distinct from `dispatch-consumer-group`); duplicate `TripAssigned` deliveries: log again (idempotent log writes acceptable in Phase 1)
-    - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.8_
+  - [ ]* 3.9 Write property test for Dispatch Service event type filtering (Property 4)
+    - File: `services/dispatch/src/test/java/LocationPingConsumerTest.java`
+    - `// Feature: e2e-skeleton, Property 4: Dispatch Service event type filtering`
+    - Use `jqwik` `@Property` to generate random `event_type` strings excluding `"TripRequested"`
+    - Assert: `RideEventsConsumer` does NOT call `dispatchService.assignDriver()` and does NOT publish a `TripAssigned` event for any non-`TripRequested` event type
+    - **Property 4: Dispatch Service event type filtering**
+    - **Validates: Requirements 3.1**
 
-  - [ ]* 5.3 Write property tests for the Notification Service (Hypothesis) in `tests/test_notification_consumer.py`
-    - **Property 7: Notification Service logs all required fields for TripAssigned events** — generate random `TripAssigned` payloads (any `event_id`, `trip_id`, `driver_id`, `rider_id`, `assigned_at`); call `parse_trip_assigned()` then `handle_trip_assigned()`; assert the stdout JSON line captured via `NotificationLogger` contains all seven required fields. Mock the Kafka consumer.
-    - **Property 8: Notification Service filters non-TripAssigned events** — generate random `event_type` strings excluding `"TripAssigned"`; assert `KafkaConsumerWorker` dispatches to `skip_handler` (no-op), no stdout output is produced, and no error log is emitted.
-    - Tag each test with `# Feature: e2e-skeleton, Property N: <title>`; run minimum 100 iterations per property
-    - _Requirements: 4.2, 4.3_
+  - [ ]* 3.10 Write property test for gps-pings envelope validation (Property 6)
+    - File: `services/dispatch/src/test/java/LocationPingConsumerTest.java`
+    - `// Feature: e2e-skeleton, Property 6: Dispatch Service gps-pings envelope validation`
+    - Use `jqwik` `@Property` to generate: valid envelopes, envelopes with missing `event_id`, envelopes with wrong `event_type`, non-Avro byte sequences
+    - Assert: invalid/malformed messages log a WARNING and do not crash the consumer; valid `LocationPingReceived` envelopes are logged at DEBUG level
+    - **Property 6: Dispatch Service gps-pings envelope validation**
+    - **Validates: Requirements 3.14, 3.15**
 
-  - [ ] 5.4 Generate and commit the Notification Service OpenAPI spec
-    - Configure FastAPI to auto-generate the OpenAPI spec at startup in `main.py` lifespan and write it to `services/notification/openapi.json`
-    - Verify the spec includes the `GET /health` endpoint and all response codes
-    - _Requirements: 4.5, 8.2, 8.4, 8.6_
+  - [ ]* 3.11 Write property test for Trip state machine persistence round-trip (Property 9)
+    - File: `services/dispatch/src/test/java/TripRepositoryTest.java`
+    - `// Feature: e2e-skeleton, Property 9: Trip state machine persistence round-trip`
+    - Use `jqwik` `@Property` with H2 in-memory DB to generate: random `rider_id` strings, valid `pickup_location` coordinates
+    - Assert: after `requestRide()`, `trips` table contains record with matching `trip_id` and `status = 'REQUESTED'`; after `assignDriver()`, same record has `status = 'ASSIGNED'`, non-null `driver_id`, non-null `assigned_at`
+    - **Property 9: Trip state machine persistence round-trip**
+    - **Validates: Requirements 3.16**
 
-- [ ] 6. Driver Simulator script
-  - [ ] 6.1 Implement `scripts/simulate_driver.py`
-    - Accept CLI arguments: `--driver-id` (string), `--route-file` (path to GeoJSON LineString), `--rate` (pings/sec, default 10), `--ingest-url` (base URL)
-    - Read the GeoJSON LineString from `--route-file`; exit non-zero with an error message if the file is not found or is not a valid GeoJSON LineString
-    - Interpolate positions along the route at the configured rate; POST each position to `{ingest-url}/location` with the `GpsPingRequest` JSON shape (`driver_id`, `latitude`, `longitude`, `timestamp`)
-    - On non-2xx response: log error to stderr (status code + response body), continue emitting
-    - On route end: loop back to the start (infinite loop until interrupted)
-    - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6_
+  - [ ]* 3.12 Write property test for Dispatch Service startup fails fast on missing env vars (Property 12)
+    - File: `services/dispatch/src/test/java/RequestRideEndpointTest.java`
+    - `// Feature: e2e-skeleton, Property 12: Dispatch Service startup fails fast on missing environment variables`
+    - Use `jqwik` `@Property` to omit each required env var in turn (`KAFKA_BOOTSTRAP_SERVERS`, `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD`, `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD`)
+    - Assert: `AppConfig.validateRequiredEnvVars()` throws `IllegalStateException` with a message identifying the missing variable name; application context does not finish loading
+    - **Property 12: Dispatch Service startup fails fast on missing environment variables**
+    - **Validates: Requirements 10.10**
 
-  - [ ] 6.2 Create `scripts/sample_route.geojson`
-    - Write a GeoJSON FeatureCollection containing a LineString with at least 10 coordinate pairs representing a plausible city-scale route
-    - _Requirements: 5.7_
 
-  - [ ]* 6.3 Write property tests for the Driver Simulator (Hypothesis)
-    - **Property 11: Driver Simulator route looping** — generate valid GeoJSON LineString routes of varying lengths (2–100 coordinate pairs); after the simulator emits a ping for the last coordinate, assert the next emitted ping has coordinates near the first coordinate of the route (within interpolation tolerance). Mock the HTTP POST call.
-    - Tag with `# Feature: e2e-skeleton, Property 11: Driver Simulator route looping`; run minimum 100 iterations
-    - _Requirements: 5.6_
+- [ ] 4. Checkpoint — Ingest and Dispatch tests pass
+  - Ensure all tests in `services/ingest/tests/` and `services/dispatch/src/test/java/` pass, ask the user if questions arise.
 
-- [ ] 7. Minimal React Rider UI
-  - [ ] 7.1 Scaffold the Rider UI project
-    - Create `services/rider-ui/` with a React 18 app (Create React App or Vite); add `react-leaflet` and `leaflet` as pinned dependencies
-    - Configure `REACT_APP_DISPATCH_URL` (or `VITE_DISPATCH_URL`) as a build-time environment variable for the Dispatch Service URL
+- [ ] 5. Go Notification Service
+  - [ ] 5.1 Scaffold Notification Service module structure and config
+    - Initialise Go module at `services/notification/` (`go mod init`)
+    - Add dependencies: `github.com/confluentinc/confluent-kafka-go/v2`, `github.com/rs/zerolog` (or `log/slog`), `go.opentelemetry.io/otel`, `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`, `pgregory.net/rapid` (test-only), `github.com/stretchr/testify`
+    - Implement `config/config.go`: `Config` struct with `KafkaBootstrapServers`, `KafkaTopic`, `KafkaSASLUsername`, `KafkaSASLPassword`, `KafkaConsumerGroupID`, `SchemaRegistryURL`, `ServicePort`, `OTELEndpoint`; `LoadConfig()` reads via `os.Getenv`; logs descriptive error identifying the missing variable and calls `os.Exit(1)` on any missing required var
+    - _Requirements: 4.7, 10.10_
+
+  - [ ] 5.2 Implement Notification Service structured logger (`logger/logger.go`)
+    - Implement `logger.Logger` struct wrapping zerolog (or slog) configured to emit JSON to stdout
+    - Implement `LogNotification(event events.TripAssignedEvent)` method — writes one JSON line with fields: `event_id`, `event_type`, `trip_id`, `driver_id`, `rider_id`, `assigned_at`, `notification_sent_at` (`time.Now().UTC()` ISO 8601), `trace_id` (extracted from OTel span context)
+    - Implement `LogWarning(msg string, rawBytes []byte)` method — writes JSON warning line to stderr with `trace_id`
+    - All log output MUST go through `Logger` methods — never `fmt.Println()` or raw `log` calls
+    - _Requirements: 4.2, 12.3_
+
+  - [ ] 5.3 Implement Notification Service domain event parser (`events/trip_assigned.go`)
+    - Implement `TripAssignedEvent` struct with unexported fields: `eventID`, `eventType`, `tripID`, `driverID`, `riderID`, `assignedAt`
+    - Implement accessor methods: `EventID()`, `TripID()`, `DriverID()`, `RiderID()`, `AssignedAt()`
+    - Implement `ParseTripAssigned(envelope map[string]interface{}) (TripAssignedEvent, error)` — validates all required fields are present and non-empty; returns `EventParseError` (with field name) if any required field is absent; never returns a partially-constructed `TripAssignedEvent`
+    - _Requirements: 4.2, 4.4_
+
+  - [ ] 5.4 Implement Notification Service handlers and consumer worker
+    - Implement `handler/trip_assigned.go`: `HandleTripAssigned(event events.TripAssignedEvent, log *logger.Logger)` — calls `log.LogNotification(event)`; `NoOpHandler` no-op `HandlerFunc` for all other event types
+    - Implement `consumer/worker.go`: `HandlerFunc` type `func(envelope map[string]interface{})`; `Worker` struct with `consumer *confluent.Consumer`, `handlers map[string]HandlerFunc`, `stopCh chan struct{}`; `NewWorker(cfg config.Config, handlers map[string]HandlerFunc) (*Worker, error)` — configure consumer with SASL/PLAIN, Schema Registry Avro deserialiser; `Start()` launches `run()` goroutine; `Stop()` signals stop and waits; `run()` loop: `Poll()` → Avro deserialise → extract `event_type` → `handlers[eventType](envelope)` (fallback to `NoOpHandler`) → `CommitOffsets()`; on Avro deserialisation failure: call `log.LogWarning()` with raw bytes, commit offset, continue; extract W3C `traceparent` header from Kafka message headers to create child OTel span
+    - _Requirements: 4.1, 4.3, 4.4, 4.8, 12.1_
+
+  - [ ] 5.5 Implement Notification Service main entrypoint and HTTP server
+    - Implement `main.go`: initialise OTel tracer, call `config.LoadConfig()`, construct `logger.Logger`, build handler map `{"TripAssigned": HandleTripAssigned, "*": NoOpHandler}`, construct `consumer.NewWorker(cfg, handlers)`, call `worker.Start()`, start HTTP server on `cfg.ServicePort` with `GET /health` (200 `{"status":"ok"}`) and `GET /metrics` (Prometheus text format) routes, auto-generate OpenAPI spec to `services/notification/openapi.json` at startup, implement graceful shutdown on SIGTERM/SIGINT calling `worker.Stop()`
+    - _Requirements: 4.5, 4.6, 4.7, 8.2, 12.2_
+
+  - [ ] 5.6 Write Notification Service Dockerfile
+    - Write `infra/docker/notification.Dockerfile` (or `services/notification/Dockerfile`): multi-stage — `FROM golang:1.22-alpine AS builder` with `CGO_ENABLED=0`; `FROM gcr.io/distroless/static-debian12` final stage; `USER nonroot:nonroot`; pinned versions, never `latest`
+    - _Requirements: 4.9, 10.6, 10.7_
+
+  - [ ]* 5.7 Write property test for Notification Service logs all required fields (Property 7)
+    - File: `services/notification/tests/worker_test.go`
+    - `// Feature: e2e-skeleton, Property 7: Notification Service logs all required fields for TripAssigned events`
+    - Use `pgregory.net/rapid` to generate random `TripAssigned` payloads with varying `event_id`, `trip_id`, `driver_id`, `rider_id`, `assigned_at` values
+    - Assert: structured JSON log line written to stdout contains all required fields: `event_id`, `event_type`, `trip_id`, `driver_id`, `rider_id`, `assigned_at`, `notification_sent_at`; capture stdout in test using a buffer writer injected into `logger.Logger`
+    - **Property 7: Notification Service logs all required fields for TripAssigned events**
+    - **Validates: Requirements 4.2**
+
+  - [ ]* 5.8 Write property test for Notification Service filters non-TripAssigned events (Property 8)
+    - File: `services/notification/tests/worker_test.go`
+    - `// Feature: e2e-skeleton, Property 8: Notification Service filters non-TripAssigned events`
+    - Use `pgregory.net/rapid` to generate random `event_type` strings excluding `"TripAssigned"`
+    - Assert: `Worker` acknowledges the message, does NOT call `HandleTripAssigned`, does NOT write any line to stdout; `NoOpHandler` is invoked instead
+    - **Property 8: Notification Service filters non-TripAssigned events**
+    - **Validates: Requirements 4.3**
+
+
+- [ ] 6. Go Gateway Service
+  - [ ] 6.1 Scaffold Gateway Service module structure and config
+    - Initialise Go module at `services/gateway/` (`go mod init`)
+    - Add dependencies: `github.com/gorilla/websocket`, `github.com/confluentinc/confluent-kafka-go/v2`, `go.opentelemetry.io/otel`, `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`, `pgregory.net/rapid` (test-only), `github.com/stretchr/testify`
+    - Implement `config/config.go`: `Config` struct with `KafkaBootstrapServers`, `KafkaTopic`, `KafkaSASLUsername`, `KafkaSASLPassword`, `KafkaConsumerGroupID`, `SchemaRegistryURL`, `ServicePort`, `OTELEndpoint`; `LoadConfig()` reads via `os.Getenv`; logs descriptive error identifying the missing variable and calls `os.Exit(1)` on any missing required var
+    - _Requirements: 9.1, 10.10_
+
+  - [ ] 6.2 Implement Gateway Service session registry (`session/registry.go`)
+    - Implement `Registry` struct with `mu sync.RWMutex` and `sessions map[string]*websocket.Conn` (Phase 1 in-memory; keyed by `rider_id`)
+    - Implement `Register(riderID string, conn *websocket.Conn)` — acquires write lock, stores connection
+    - Implement `Unregister(riderID string)` — acquires write lock, removes connection
+    - Implement `Send(riderID string, payload []byte) error` — acquires read lock, looks up connection, calls `conn.WriteMessage(websocket.TextMessage, payload)`; returns error if rider not connected (no-op, not a crash)
+    - _Requirements: 9.2, 9.4_
+
+  - [ ] 6.3 Implement Gateway Service WebSocket handler (`handler/websocket.go`)
+    - Implement `WebSocketHandler` struct with `Registry *session.Registry` field (constructor injection)
+    - Implement `ServeHTTP` for `GET /ws?rider_id=<string>`: validate `rider_id` query param (non-empty); upgrade HTTP connection using `gorilla/websocket` upgrader; call `registry.Register(riderID, conn)`; run read loop (heartbeat / ping-pong); on disconnect call `registry.Unregister(riderID)`
+    - Implement `GET /health` handler returning `200 {"status": "ok"}`
+    - _Requirements: 9.2, 9.5_
+
+  - [ ] 6.4 Implement Gateway Service Kafka consumer worker (`consumer/worker.go`)
+    - Implement `Worker` struct with `consumer *confluent.Consumer`, `registry *session.Registry`, `stopCh chan struct{}`
+    - Implement `NewWorker(cfg config.Config, registry *session.Registry) (*Worker, error)` — configure consumer with SASL/PLAIN, Schema Registry Avro deserialiser, consumer group `gateway-consumer-group`
+    - Implement `Start()` / `Stop()` for graceful lifecycle management
+    - Implement `run()` loop: `Poll()` → Avro deserialise → extract `event_type`; filter for `TripAssigned`, `TripCancelled`, `TripCompleted`; extract `rider_id` from payload; call `registry.Send(riderID, jsonPayload)`; commit offset; on Avro deserialisation failure: log warning, commit offset, continue; extract W3C `traceparent` header from Kafka message headers to create child OTel span
+    - The Gateway does NOT fan out events — it translates one Kafka event to one WebSocket push for the specific connected rider
+    - _Requirements: 9.1, 9.3, 9.4, 12.1_
+
+  - [ ] 6.5 Implement Gateway Service main entrypoint with OTel and metrics
+    - Implement `main.go`: initialise OTel tracer, call `config.LoadConfig()`, construct `session.Registry`, construct `consumer.NewWorker(cfg, registry)`, call `worker.Start()`, build `chi` (or `net/http`) router with `GET /ws` → `WebSocketHandler`, `GET /health`, `GET /metrics` (Prometheus text format including active WebSocket connection count gauge), start HTTP server on `cfg.ServicePort`, implement graceful shutdown on SIGTERM/SIGINT
+    - _Requirements: 9.5, 12.2, 12.3_
+
+  - [ ] 6.6 Write Gateway Service Dockerfile
+    - Write `infra/docker/gateway.Dockerfile` (or `services/gateway/Dockerfile`): multi-stage — `FROM golang:1.22-alpine AS builder` with `CGO_ENABLED=0`; `FROM gcr.io/distroless/static-debian12` final stage; `USER nonroot:nonroot`; pinned versions, never `latest`
+    - _Requirements: 9.6, 10.6, 10.7_
+
+
+- [ ] 7. Driver Simulator script (Python)
+  - [ ] 7.1 Implement Driver Simulator script and sample route
+    - Write `scripts/simulate_driver.py` (Python 3.11, stdlib + `requests` only):
+      - Accept CLI args: `--driver-id` (string), `--route-file` (path to GeoJSON LineString), `--rate` (pings/sec, default 10), `--ingest-url` (base URL)
+      - Read and parse GeoJSON LineString from `--route-file`; exit non-zero with stderr error if file not found or not a valid GeoJSON LineString
+      - Interpolate positions along the route at the configured rate; loop back to start when route end is reached
+      - POST each position to `{ingest-url}/location` with JSON body `{"driver_id": ..., "latitude": ..., "longitude": ..., "timestamp": <ISO 8601>}`
+      - On non-2xx response: log to stderr with HTTP status code and response body; continue emitting
+      - On network timeout: log to stderr; continue emitting
+    - Write `scripts/sample_route.geojson`: valid GeoJSON LineString with ≥10 coordinate pairs
+    - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7_
+
+  - [ ]* 7.2 Write property test for Driver Simulator route looping (Property 11)
+    - File: `scripts/test_simulate_driver.py` (pytest)
+    - `# Feature: e2e-skeleton, Property 11: Driver Simulator route looping`
+    - Use `hypothesis` to generate valid GeoJSON LineString routes of varying lengths (2–100 coordinate pairs)
+    - Assert: after the simulator emits a ping for the last coordinate, the next emitted ping has coordinates near the first coordinate of the route (within interpolation tolerance of 0.001 degrees)
+    - Mock the HTTP POST call; do not require a running Ingest Service
+    - **Property 11: Driver Simulator route looping**
+    - **Validates: Requirements 5.6**
+
+- [ ] 8. Minimal React Rider UI
+  - [ ] 8.1 Scaffold Rider UI React application
+    - Initialise React 18 TypeScript app at `services/rider-ui/` using Create React App or Vite with TypeScript template
+    - Add dependencies: `react-leaflet`, `leaflet`, `@types/leaflet`
+    - Configure `REACT_APP_DISPATCH_URL` as a build-time environment variable (read from `.env` / `.env.example`)
     - _Requirements: 6.1, 6.6_
 
-  - [ ] 7.2 Implement the map view and "Request Ride" button
-    - Render a Leaflet map centred on a default coordinate pair at a city-scale zoom level
-    - Add a "Request Ride" button that POSTs to `${DISPATCH_URL}/request-ride` with a hardcoded `rider_id` and the map centre as `pickup_location`
-    - On HTTP 202: display the returned `trip_id` on screen
-    - On non-2xx response: display a human-readable error message; do not leave the user with a blank or crashed page
+  - [ ] 8.2 Implement Rider UI map and ride request flow
+    - Implement Leaflet map component centred on a default coordinate pair at city-scale zoom level
+    - Implement "Request Ride" button: on click, POST to `${REACT_APP_DISPATCH_URL}/request-ride` with hardcoded `rider_id` and map centre as `pickup_location`
+    - On HTTP 202: display returned `trip_id` on screen
+    - On non-2xx response: display human-readable error message; do NOT leave the user with a blank or crashed page (use try/catch + error state)
     - _Requirements: 6.2, 6.3, 6.4, 6.5_
 
-  - [ ] 7.3 Add a production Dockerfile for the Rider UI static build
-    - Multi-stage Dockerfile: build stage uses `node:20.12-alpine` (pinned), serve stage uses `nginx:1.25-alpine` (pinned) as a non-root user
-    - The built static assets are served by nginx; `REACT_APP_DISPATCH_URL` is injected at build time
-    - _Requirements: 6.6, 10.6, 10.7_
+  - [ ] 8.3 Write Rider UI Dockerfile
+    - Write `infra/docker/rider-ui.Dockerfile` (or `services/rider-ui/Dockerfile`): multi-stage — `FROM node:20.12-alpine AS builder` runs `npm ci && npm run build`; `FROM nginx:1.25-alpine` serves static build; pinned versions, never `latest`; non-root user
+    - _Requirements: 6.6, 10.7_
 
-- [ ] 8. docker-compose local environment
-  - [ ] 8.1 Define infrastructure containers (Kafka KRaft, PostgreSQL, Redis)
-    - Add Apache Kafka container to `docker-compose.yml` running in KRaft mode (single-node combined broker+controller: `KAFKA_PROCESS_ROLES=broker,controller`, `KAFKA_NODE_ID=1`, `KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093`); use `confluentinc/cp-kafka:7.6.1` (pinned); configure SASL/PLAIN authentication; use an init container or `kafka-topics.sh` entrypoint script to create topics `gps-pings`, `ride-events`, `dispatch-commands`, and `notifications` on first startup
-    - Add PostgreSQL container with a non-empty password loaded from `${POSTGRES_PASSWORD}`; define a named volume for data persistence
-    - Add Redis container with a non-empty password loaded from `${REDIS_PASSWORD}`; define a named volume for data persistence
-    - All credentials referenced via `${VAR_NAME}` substitution — no hardcoded values
-    - _Requirements: 7.1, 7.3, 7.5, 7.9, 7.10, 10.3, 10.4_
 
-  - [ ] 8.2 Define named Docker networks and assign services
-    - Define three named networks: `kafka-net`, `db-net`, `frontend-net`
-    - Assign: Kafka broker + all services → `kafka-net`; PostgreSQL + Redis + Dispatch Service → `db-net`; Dispatch Service + Rider UI → `frontend-net`
-    - Ingest Service and Notification Service MUST NOT be connected to `db-net`; Rider UI MUST NOT be connected to `kafka-net` or `db-net`
-    - _Requirements: 7.8, 10.5_
+- [ ] 9. docker-compose local environment
+  - [ ] 9.1 Write docker-compose Kafka KRaft cluster and Schema Registry
+    - Define three Kafka broker services (`kafka-1`, `kafka-2`, `kafka-3`) using `confluentinc/cp-kafka:7.6.1` (pinned); configure each with `KAFKA_PROCESS_ROLES=broker,controller`, unique `KAFKA_NODE_ID`, `KAFKA_CONTROLLER_QUORUM_VOTERS` listing all three nodes, `KAFKA_LISTENERS` for both broker and controller ports; configure SASL/PLAIN authentication (`KAFKA_LISTENER_SECURITY_PROTOCOL_MAP`, `KAFKA_SASL_ENABLED_MECHANISMS=PLAIN`); each service credential loaded from `${VAR_NAME}` env var substitution — no hardcoded passwords
+    - Define a `kafka-init` one-shot service that creates topics `gps-pings`, `ride-events`, `dispatch-commands`, `notifications` with `replication.factor=3`, `min.insync.replicas=2` after brokers are healthy
+    - Define `schema-registry` service using `confluentinc/cp-schema-registry:7.6.1` (pinned); connect to all three brokers; expose port 8081
+    - Attach all Kafka services to `kafka-net` only
+    - _Requirements: 7.1, 7.3, 7.9_
 
-  - [ ] 8.3 Wire all service containers with environment variables and health checks
-    - Add service containers for Ingest Service (host port 8001), Dispatch Service (host port 8080), Notification Service (host port 8002), and Rider UI
-    - Inject all inter-service hostnames and ports via environment variables; no service hardcodes another service's hostname
-    - Configure each service with its own dedicated Kafka SASL credentials (`${INGEST_KAFKA_USERNAME}`, `${INGEST_KAFKA_PASSWORD}`, etc.) — no shared credentials
-    - Add health checks for all containers; configure `restart: on-failure` (not `always`) so failures surface in `docker-compose up` output
-    - Verify `docker-compose up` reaches a healthy state within 120 seconds
-    - _Requirements: 7.2, 7.4, 7.6, 7.7, 7.9, 10.3, 10.4_
+  - [ ] 9.2 Write docker-compose database and connection pooling services
+    - Define `postgres` service using `postgres:16-alpine` (pinned): set `POSTGRES_PASSWORD` from `${POSTGRES_PASSWORD}` env var; named volume `postgres-data` for persistence; attach to `db-net` only
+    - Define `pgbouncer` service using `edoburu/pgbouncer` (pinned): configure transaction pooling mode; `DB_HOST=postgres`, credentials from env vars; expose port 5432 on `db-net`; attach to `db-net` only
+    - Define `redis` service using `redis:7.2-alpine` (pinned): set password via `requirepass ${REDIS_PASSWORD}`; named volume `redis-data`; attach to `db-net` only
+    - Define `dynamodb-local` service using `amazon/dynamodb-local` (pinned): expose port 8000; attach to `db-net` only (Phase 2 dedup — modelled in Phase 1)
+    - _Requirements: 7.1, 7.5, 7.10_
 
-- [ ] 9. OpenAPI spec generation and commit script
-  - [ ] 9.1 Create the `scripts/generate_openapi.sh` script
-    - The script starts each FastAPI service in a temporary subprocess, waits for it to be ready, fetches the generated spec, and writes it to the committed path (`services/ingest/openapi.json`, `services/notification/openapi.json`)
-    - For the Dispatch Service, the script starts the Spring Boot app (or uses the running docker-compose container), fetches `/v3/api-docs`, and writes to `services/dispatch/openapi.json`
-    - The script exits with a non-zero code if any regenerated spec differs from the committed version (using `diff`), enabling CI enforcement
-    - _Requirements: 8.5_
+  - [ ] 9.3 Write docker-compose application service definitions
+    - Define `ingest-service` container: build from Ingest Dockerfile; expose host port 8001; inject all required env vars from `${VAR_NAME}` substitution; attach to `kafka-net` and `observability-net`; health check on `GET /health`
+    - Define `dispatch-service` container: build from Dispatch Dockerfile; expose host port 8080; inject all required env vars; attach to `kafka-net`, `db-net`, `frontend-net`, `observability-net`; health check on `GET /health`
+    - Define `notification-service` container: build from Notification Dockerfile; expose host port 8002; inject all required env vars; attach to `kafka-net` and `observability-net`; health check on `GET /health`
+    - Define `gateway-service` container: build from Gateway Dockerfile; expose host port 8003; inject all required env vars; attach to `kafka-net`, `frontend-net`, `observability-net`; health check on `GET /health`
+    - Define `rider-ui` container: build from Rider UI Dockerfile; attach to `frontend-net`; inject `REACT_APP_DISPATCH_URL` build arg
+    - Configure `restart: on-failure` (not `always`) so failed containers surface in `docker-compose up` output without silent infinite restart loops
+    - _Requirements: 7.1, 7.2, 7.4, 7.6, 7.7, 7.8_
 
-  - [ ]* 9.2 Validate committed OpenAPI specs are valid OpenAPI 3.x
-    - Add a check in `generate_openapi.sh` (or a separate `scripts/validate_openapi.sh`) that runs a lightweight OpenAPI validator (e.g., `openapi-spec-validator` Python package) against each committed spec file
-    - Exit non-zero if any spec fails validation
-    - _Requirements: 8.4_
+  - [ ] 9.4 Write docker-compose observability stack (Jaeger, Prometheus, Grafana)
+    - Define `jaeger` service using `jaegertracing/all-in-one:1.56` (pinned): expose host port 16686 (UI) and OTLP receiver port 4317; attach to `observability-net`
+    - Define `prometheus` service using `prom/prometheus:v2.51.0` (pinned): mount `infra/prometheus.yml` config that scrapes `/metrics` from all four application services; expose host port 9090; attach to `observability-net`
+    - Define `grafana` service using `grafana/grafana:10.4.0` (pinned): expose host port 3000; configure Prometheus and Jaeger as data sources; attach to `observability-net`
+    - Write `infra/prometheus.yml` with scrape configs for `ingest-service:8001`, `dispatch-service:8080`, `notification-service:8002`, `gateway-service:8003`
+    - Define four named Docker networks: `kafka-net`, `db-net`, `frontend-net`, `observability-net`
+    - _Requirements: 7.1, 7.8, 12.4, 12.5_
 
-- [ ] 10. Security baseline hardening
-  - [ ] 10.1 Audit and complete `.env.example`
-    - Ensure `.env.example` documents every environment variable required by every service and the docker-compose environment, with placeholder values and a comment explaining each variable's purpose — including all `Settings(BaseSettings)` fields from Ingest and Notification `config.py`, all `AppConfig.validateRequiredEnvVars()` entries from Dispatch, and all docker-compose `${VAR_NAME}` substitutions
-    - Verify `.env` is listed in `.gitignore` and no `.env` file exists in the repository
-    - _Requirements: 1.7, 10.1, 10.2_
 
-  - [ ] 10.2 Verify Dockerfile security controls across all services
-    - Confirm each Dockerfile (Ingest, Dispatch, Notification, Rider UI) uses a pinned base image version (not `latest`) — `python:3.11.9-slim` for Python services, `eclipse-temurin:21-jre-jammy` for Dispatch, `node:20.12-alpine` / `nginx:1.25-alpine` for Rider UI — and includes a `USER appuser` directive
-    - Add a `scripts/check_dockerfiles.sh` script that greps each Dockerfile for `FROM.*:latest` and exits non-zero if any match is found
-    - _Requirements: 2.11, 3.12, 4.9, 10.6, 10.7_
+- [ ] 10. OpenAPI spec generation and commit script
+  - [ ] 10.1 Implement OpenAPI spec generation and CI enforcement script
+    - Verify `services/ingest/main.go` writes `services/ingest/openapi.json` at startup (auto-generated from handler registrations or a hand-authored spec matching the design)
+    - Verify `services/notification/main.go` writes `services/notification/openapi.json` at startup
+    - Write `scripts/generate_openapi.sh`: starts each Go service briefly (or uses a dedicated `--dump-openapi` flag), exports the spec, then stops the service; for Dispatch, calls `curl http://localhost:8080/v3/api-docs -o services/dispatch/openapi.json`
+    - Add a `Makefile` target `check-openapi` that runs `generate_openapi.sh`, diffs each generated file against the committed version, and exits non-zero if any diff is found — enables CI enforcement
+    - Validate all three committed `openapi.json` files are valid OpenAPI 3.x (use `swagger-cli validate` or equivalent)
+    - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6_
 
-  - [ ] 10.3 Verify startup fail-fast behaviour for missing environment variables
-    - Confirm Ingest and Notification services raise `pydantic_settings.ValidationError` (from `Settings(BaseSettings)`) and exit non-zero when a required env var is absent
-    - Confirm Dispatch service's `AppConfig.validateRequiredEnvVars()` `@PostConstruct` throws `IllegalStateException` with the missing variable name and exits non-zero
-    - Write unit tests for each service's startup configuration validation: one test per required variable, asserting the descriptive error message identifies the missing variable
-    - _Requirements: 10.10_
+- [ ] 11. Security baseline hardening
+  - [ ] 11.1 Audit and enforce security baseline across all services and docker-compose
+    - Verify `.env.example` documents every environment variable required by all services with placeholder values and inline comments explaining each variable's purpose; verify `.env` is in `.gitignore`
+    - Verify `docker-compose.yml` uses `${VAR_NAME}` substitution for all credentials — no hardcoded passwords, usernames, or API keys anywhere in committed files
+    - Verify Kafka SASL/PLAIN ACLs are defined in `infra/kafka/` restricting each service to only the topics it needs: `ingest` → produce `gps-pings`; `dispatch` → produce/consume `ride-events`, consume `gps-pings`; `notification` → consume `ride-events`; `gateway` → consume `ride-events`
+    - Verify all four Go Dockerfiles have `USER nonroot:nonroot` and use `gcr.io/distroless/static-debian12` final stage; verify Dispatch Dockerfile has `USER appuser`; verify Rider UI Dockerfile has non-root user
+    - Verify all Dockerfiles use pinned base image versions (no `latest` tags)
+    - Verify `driver_id` and `rider_id` validation (non-empty, max 128 chars) is enforced in Ingest Service (`go-playground/validator` tags) and Dispatch Service (`@Valid` annotations)
+    - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.9_
 
-- [ ] 11. Checkpoint — All service tests pass, docker-compose starts cleanly
-  - Ensure all unit and property tests pass for all three services. Run `docker-compose up` and confirm all containers reach a healthy state within 120 seconds. Ask the user if questions arise.
+- [ ] 12. Checkpoint — All service tests pass, docker-compose starts cleanly
+  - Ensure all tests in `services/ingest/tests/`, `services/dispatch/src/test/java/`, and `services/notification/tests/` pass; ensure `docker-compose up` reaches a healthy state with all services passing health checks within 120 seconds; ask the user if questions arise.
 
-- [ ] 12. Smoke test script and end-to-end validation
-  - [ ] 12.1 Implement `scripts/smoke_test.sh`
-    - Start the Driver Simulator (`scripts/simulate_driver.py`) for 5 seconds against the running Compose environment
-    - Submit one Ride Request via `curl` to `POST /request-ride` and capture the returned `trip_id`
-    - Poll the Notification Service container logs (`docker logs`) for a JSON line containing the matching `trip_id` and `event_type = "TripAssigned"`, with a 10-second timeout
-    - On match found: exit 0
-    - On timeout: exit non-zero and print a diagnostic message identifying which pipeline stage (Ingest, Dispatch, Notification) did not produce the expected output
-    - _Requirements: 11.4, 11.5_
+- [ ] 13. Smoke test and e2e validation
+  - [ ] 13.1 Write smoke test script (`scripts/smoke_test.sh`)
+    - Write `scripts/smoke_test.sh` (bash):
+      1. Start Driver Simulator (`python scripts/simulate_driver.py --driver-id smoke-driver-001 --route-file scripts/sample_route.geojson --rate 10 --ingest-url http://localhost:8001`) for 5 seconds; capture PID and kill after 5 seconds
+      2. Submit one Ride Request: `curl -s -X POST http://localhost:8080/request-ride -H 'Content-Type: application/json' -d '{"rider_id":"smoke-rider-001","pickup_location":{"latitude":37.7749,"longitude":-122.4194}}'`; capture `trip_id` from JSON response
+      3. Poll `docker logs notification-service` every 1 second for up to 10 seconds looking for a JSON log line containing the captured `trip_id` and `"event_type":"TripAssigned"`
+      4. On match found: print success message, exit 0
+      5. On timeout: print diagnostic message identifying which pipeline stage did not produce output (check Ingest logs, Dispatch logs, Notification logs in sequence), exit non-zero
+    - _Requirements: 11.1, 11.2, 11.4, 11.5_
 
-  - [ ] 12.2 Validate the end-to-end pipeline invariants in the smoke test
-    - Assert that the `trip_id` in the `TripAssigned` log line matches the `trip_id` returned by `POST /request-ride` (Requirement 11.2)
-    - Assert that the `event_id` field is present and non-empty in the logged output
-    - Assert that the notification appears within 5 seconds of the Ride Request being accepted (Requirement 11.1)
-    - _Requirements: 11.1, 11.2_
-
-  - [ ]* 12.3 Write a sustained throughput integration test
-    - Write a script or pytest test that sends 10 GPS pings per second to the Ingest Service for 5 seconds (50 total pings) and asserts that no HTTP 5xx responses are returned
+  - [ ] 13.2 Write sustained throughput validation
+    - Extend `scripts/smoke_test.sh` or write `scripts/throughput_test.sh`: run Driver Simulator at 10 pings/second for 5 seconds; assert zero HTTP 5xx responses from Ingest Service during the run (parse simulator stderr for error lines); exit non-zero if any 5xx is observed
     - _Requirements: 11.3_
 
-  - [ ]* 12.4 Write a property test for the trip_id correlation invariant (Hypothesis)
-    - **Property 10: trip_id correlation across the full pipeline** — generate random valid ride requests; for each, assert that the `trip_id` returned in the HTTP 202 response from `POST /request-ride` equals the `trip_id` in the `TripAssigned` Domain Event logged by the Notification Service. Run against the docker-compose environment with mocked Kafka or a test Kafka (KRaft) instance.
-    - Tag with `# Feature: e2e-skeleton, Property 10: trip_id correlation across the full pipeline`
-    - _Requirements: 11.2_
+- [ ] 14. Final checkpoint — Ensure all tests pass
+  - Ensure all tests pass across all services, `docker-compose up` starts cleanly, `scripts/smoke_test.sh` exits 0, and `make check-openapi` exits 0; ask the user if questions arise.
 
-- [ ] 13. Final checkpoint — Smoke test passes end-to-end
-  - Run `scripts/smoke_test.sh` against the full docker-compose environment and confirm it exits 0. Ensure all committed OpenAPI specs are valid and up to date. Ask the user if questions arise.
-
----
 
 ## Notes
 
-- Tasks marked with `*` are optional and can be skipped for a faster MVP; all core pipeline tasks are required
+- Tasks marked with `*` are optional and can be skipped for a faster MVP; all property tests are optional sub-tasks
 - Each task references specific requirements for traceability
-- Property tests use Hypothesis (Python) and jqwik (Java); Kafka interactions are mocked in unit/property tests
-- Integration and smoke tests run against the full docker-compose environment
-- **LLD design patterns per service**:
-  - Ingest: Dependency Injection (`Depends(get_producer)`), Factory Function (`build_location_ping_event()`), Settings Object (`Settings(BaseSettings)`), Middleware (`MaxBodySizeMiddleware`), Result type via exception (`KafkaPublishError`)
-  - Dispatch: State Machine with guard (`TripStatus.assertCanTransitionTo()`), Factory (`EventEnvelopeFactory`), Strategy stub (`DriverSelectionStrategy` / `HardcodedDriverSelectionStrategy`), Fail-fast `@PostConstruct` (`AppConfig.validateRequiredEnvVars()`), Stateless validator (`EnvelopeValidator.validate()`)
-  - Notification: Observer/Handler dispatch (`KafkaConsumerWorker` handler registry `dict[str, Callable]`), Null Object (`skip_handler`), Structured logging adapter (`NotificationLogger`), Frozen dataclass (`TripAssignedEvent`)
-- The Dispatch Service's `gps-pings` consumer (`LocationPingConsumer`) is a Phase 1 stub — it validates via `EnvelopeValidator` and logs only; it does not write to Redis (CQRS read model deferred to Phase 2 per ADR 005)
-- `TripCancelled` is modelled in `events/TripCancelledPayload.java` from Phase 1 but not triggered until Phase 2 (compensating event per ADR 006)
-- The Outbox Pattern and consumer-side deduplication are deferred to Phase 2 (ADR 002, ADR 003)
-- All secrets are loaded from environment variables; `.env` is gitignored; `.env.example` documents every variable
+- Go services use `pgregory.net/rapid` for property-based testing; Java Dispatch Service uses `jqwik`
+- Each property test is tagged with `// Feature: e2e-skeleton, Property N: title` (Go) or `// Feature: e2e-skeleton, Property N: title` (Java)
+- Constructor injection is used throughout Go services — no framework magic; `LocationHandler{Producer: p}`, `NewWorker(cfg, handlers)`, `WebSocketHandler{Registry: r}`
+- `MaxBodySize(65536)` is a standard Go middleware `func(http.Handler) http.Handler` applied in the `chi` router chain in `main.go` — not checked inline in handlers
+- `config.LoadConfig()` calls `os.Exit(1)` with a descriptive error on any missing required env var — services never start with missing configuration
+- `Worker` in Notification and Gateway uses a `map[string]HandlerFunc` dispatch registry — adding a new event type handler requires no changes to the consumer loop
+- All Kafka producers use `acks=all`, `enable.idempotence=true`; W3C `traceparent` headers are injected by producers and extracted by consumers
+- Go Dockerfiles: `golang:1.22-alpine` build → `gcr.io/distroless/static-debian12` final; Java: `eclipse-temurin:21-jre-jammy`; Rider UI: `node:20.12-alpine` build → `nginx:1.25-alpine`
+- DynamoDB Local is modelled in Phase 1 (container in docker-compose, schema defined) but the Notification Service dedup logic is activated in Phase 2
+- Checkpoints at Tasks 4, 12, and 14 ensure incremental validation before proceeding
 
 ## Task Dependency Graph
 
@@ -292,15 +403,20 @@ LLD reference: All tasks below reference the exact module structures, design pat
 {
   "waves": [
     { "id": 0, "tasks": ["1.1", "1.2"] },
-    { "id": 1, "tasks": ["2.1", "3.1", "5.1", "6.2"] },
-    { "id": 2, "tasks": ["2.2", "3.2", "5.2", "6.1", "7.1"] },
-    { "id": 3, "tasks": ["2.3", "3.3", "3.4", "3.5", "5.4", "6.3", "7.2"] },
-    { "id": 4, "tasks": ["2.4", "2.5", "3.6", "3.7", "5.3", "7.3"] },
-    { "id": 5, "tasks": ["8.1", "10.1", "10.2", "10.3"] },
-    { "id": 6, "tasks": ["8.2", "9.1"] },
-    { "id": 7, "tasks": ["8.3", "9.2"] },
-    { "id": 8, "tasks": ["12.1"] },
-    { "id": 9, "tasks": ["12.2", "12.3", "12.4"] }
+    { "id": 1, "tasks": ["1.3", "1.4"] },
+    { "id": 2, "tasks": ["2.1", "3.1"] },
+    { "id": 3, "tasks": ["2.2", "3.2", "3.3"] },
+    { "id": 4, "tasks": ["2.3", "3.4", "5.1", "6.1"] },
+    { "id": 5, "tasks": ["2.4", "3.5", "3.6", "5.2", "5.3", "6.2"] },
+    { "id": 6, "tasks": ["2.5", "3.7", "5.4", "6.3", "6.4"] },
+    { "id": 7, "tasks": ["2.6", "5.5", "6.5", "7.1", "8.1"] },
+    { "id": 8, "tasks": ["2.7", "2.8", "2.9", "3.8", "3.9", "3.10", "3.11", "3.12", "5.6", "5.7", "5.8", "6.6", "7.2", "8.2"] },
+    { "id": 9, "tasks": ["8.3", "9.1"] },
+    { "id": 10, "tasks": ["9.2", "9.3"] },
+    { "id": 11, "tasks": ["9.4"] },
+    { "id": 12, "tasks": ["10.1"] },
+    { "id": 13, "tasks": ["11.1"] },
+    { "id": 14, "tasks": ["13.1", "13.2"] }
   ]
 }
 ```

@@ -60,7 +60,7 @@ DISPATCH_PORT=8080
 NOTIFICATION_PORT=8002
 ```
 
-**Phase 2:** Migrate to a secrets manager (HashiCorp Vault or AWS Secrets Manager). Services fetch secrets at startup via the secrets manager SDK, not environment variables. Secret rotation does not require container restarts.
+**Phase 2:** Migrate to **HashiCorp Vault**. Services fetch secrets at startup via the Vault Agent sidecar (injects secrets as env vars or files) or the Vault SDK directly. Kubernetes auth method authenticates pods using their service account token. Dynamic secrets engine generates short-lived PostgreSQL and Kafka credentials on demand. Secret rotation does not require container restarts.
 
 ### Layer 2: Network Isolation (Phase 1)
 
@@ -165,7 +165,7 @@ The Phase 1 skeleton has no authentication — it is a local dev tool, not expos
 | Driver/rider identity binding | AuthZ | Phase 2 | JWT `sub` claim == request identity field |
 | Rate limiting | Input | Phase 2 | Token bucket at Gateway |
 | Audit logging | Audit | Phase 2 | Append-only audit table in PostgreSQL |
-| Secrets manager | Secrets | Phase 2 | Vault or AWS Secrets Manager |
+| Secrets manager | Secrets | Phase 2 | HashiCorp Vault — Vault Agent sidecar, Kubernetes auth, dynamic secrets |
 | Kubernetes NetworkPolicy | Network | Phase 3 | Deny-by-default egress |
 
 ---

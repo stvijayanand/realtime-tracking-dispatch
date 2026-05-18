@@ -72,7 +72,7 @@ All Kafka messages use Avro schema registered in Schema Registry. The `event_typ
 - The Dispatch service maintains a local CQRS read model of driver locations (Redis GEOADD) by consuming `LocationPingReceived` events — it never calls the Location/Tracking service synchronously (see ADR 005)
 - Synchronous HTTP/gRPC between services is only permitted for non-hot-path operations (admin queries, health checks)
 - Environment-specific config via environment variables — no hardcoded secrets or URLs
-- Production secrets via AWS Secrets Manager with IRSA (IAM Roles for Service Accounts on EKS)
+- Production secrets via HashiCorp Vault with Vault Agent sidecar or Vault SDK (AppRole / Kubernetes auth method)
 - Each service owns its own database schema; no cross-service direct DB access
 - PostgreSQL queries must have `EXPLAIN ANALYZE` output committed to `docs/query-plans/`
 - DynamoDB is used for high-write-throughput, single-key-lookup tables (notification dedup, idempotency keys) — not for relational data

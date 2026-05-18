@@ -110,12 +110,22 @@ Production systems are not observable by accident. OTel is instrumented from the
 ### Local Development
 - **docker-compose** — single `docker-compose up` starts the full stack: 3-broker Kafka cluster, Schema Registry, PostgreSQL + PgBouncer, Redis, DynamoDB Local, Jaeger, Prometheus, Grafana, all services
 
-### Production
+### Production / Demo on AWS
 - **AWS EKS** (Elastic Kubernetes Service) — managed Kubernetes, integrates with IAM, ALB Ingress Controller, EBS/EFS volumes
+- **MSK Serverless** — Kafka with no broker sizing; scales to near-zero at demo traffic levels; same API as provisioned MSK; use provisioned `kafka.t3.small` 3-broker cluster only for sustained production load
+- **Aurora Serverless v2** — PostgreSQL-compatible; scales to 0 ACUs when idle; cold-start ~1–2s on first query; use provisioned RDS only for sustained production load
+- **ElastiCache `cache.t3.micro`** — torn down with everything else via `terraform destroy`
+- **Spot instances** (`t3.large`) for EKS worker nodes — 60–90% cheaper than On-Demand; sufficient for a demo cluster running 5–6 small pods
 - **Horizontal Pod Autoscaler (HPA)** on all services — scale on CPU and custom metrics (Kafka consumer lag via KEDA)
-- **KEDA** (Kubernetes Event-Driven Autoscaling) — scales Kafka consumer pods based on consumer group lag. Ingest scales on `gps-pings` lag; Notification scales on `ride-events` lag.
-- **AWS ALB Ingress Controller** — replaces Kong for production; handles TLS termination, path-based routing, WAF integration
-- **Kong** — API Gateway for local dev and staging; JWT validation, rate limiting, request logging
+- **KEDA** (Kubernetes Event-Driven Autoscaling) — scales Kafka consumer pods based on consumer group lag
+- **AWS ALB Ingress Controller** — TLS termination, path-based routing, WAF integration
+
+### Cost Strategy: Spin-Up / Tear-Down
+- **Zero cost when idle** — `make demo-down` runs `terraform destroy` and stops all AWS billing
+- **~$1–2 per 4-hour demo session** — EKS Spot + MSK Serverless + Aurora Serverless v2 + ElastiCache
+- **Dead-man's switch** — a scheduled Lambda auto-destroys the environment after 6 hours without a heartbeat, preventing forgotten idle resources
+- **Self-hosted on EKS** (no extra AWS cost): HashiCorp Vault, Schema Registry, Jaeger, Prometheus, Grafana, PgBouncer
+- See `docs/adr/007-demo-infrastructure-cost-strategy.md` for full cost breakdown and Terraform module structure
 
 ### Container Standards
 - All Dockerfiles use **distroless** or `scratch` base images for Go services — no shell, no package manager, minimal attack surface
@@ -130,9 +140,9 @@ Production systems are not observable by accident. OTel is instrumented from the
 | Environment | Mechanism |
 |---|---|
 | Local dev | `.env` file (gitignored), loaded from `.env.example` |
-| Staging / Production | **AWS Secrets Manager** — services fetch secrets at startup via AWS SDK; IAM role-based access (no static credentials in containers); secret rotation without container restarts |
+| Staging / Production | **HashiCorp Vault** — services fetch secrets at startup via the Vault Agent sidecar or the Vault SDK; AppRole or Kubernetes auth method; dynamic secret rotation without container restarts |
 
-**Why AWS Secrets Manager over HashiCorp Vault**: Native AWS integration with EKS IAM roles for service accounts (IRSA) — no Vault agent sidecar needed. Secrets are fetched via the AWS SDK using the pod's IAM role. Rotation hooks integrate directly with RDS and ElastiCache.
+**Why HashiCorp Vault**: Cloud-agnostic — works identically on AWS EKS, GCP GKE, Azure AKS, and bare-metal Kubernetes. Vault's dynamic secrets engine can generate short-lived PostgreSQL credentials and Kafka SASL credentials on demand, rotating them automatically. The Vault Agent sidecar injects secrets as environment variables or files into the pod without any SDK changes in application code.
 
 ---
 
@@ -156,7 +166,7 @@ Production systems are not observable by accident. OTel is instrumented from the
 ## Security Constraints
 
 - No secrets in source control — ever. `.env` gitignored, `.env.example` committed
-- Production secrets via AWS Secrets Manager with IRSA (IAM Roles for Service Accounts)
+- Production secrets via HashiCorp Vault (Vault Agent sidecar or Vault SDK; AppRole / Kubernetes auth; dynamic secret rotation)
 - Each service has its own Kafka SASL credentials with ACLs restricted to only the topics it owns
 - Docker Compose named networks segment traffic: `kafka-net`, `db-net`, `frontend-net`
 - All Dockerfiles run as non-root users with pinned base image versions
@@ -168,24 +178,52 @@ Production systems are not observable by accident. OTel is instrumented from the
 ## Common Commands
 
 ```bash
-# Start full local stack
-docker-compose up
+# ── Local development ──────────────────────────────────────────────────────
+# Start full local stack (Kafka 3-broker, Schema Registry, PgBouncer, Redis,
+# DynamoDB Local, Jaeger, Prometheus, Grafana, all services)
+make up                  # docker-compose up -d
 
-# Build all Go services
-make build
+# Stop local stack (data volumes preserved)
+make down                # docker-compose down
+
+# Tail all service logs
+make logs                # docker-compose logs -f
+
+# Build all services
+make build               # go build ./... + mvn package
 
 # Run all tests
-make test
+make test                # go test ./... + mvn test
 
-# Run a specific service
-docker-compose up ingest
+# Lint
+make lint                # golangci-lint run + mvn checkstyle:check
 
 # Kafka topic list (local)
 docker exec kafka-1 kafka-topics.sh --bootstrap-server localhost:9092 --list
 
-# View traces
+# View distributed traces
 open http://localhost:16686  # Jaeger UI
 
-# View metrics
-open http://localhost:3000   # Grafana
+# View metrics dashboards
+open http://localhost:3000   # Grafana (admin/admin)
+
+# ── Demo infrastructure (AWS) ──────────────────────────────────────────────
+# Spin up full AWS demo environment (~10 min; ~$1–2 per 4-hour session)
+make demo-up             # terraform apply — EKS + MSK Serverless + Aurora Serverless v2 + ElastiCache
+
+# Tear down all AWS resources (billing stops immediately)
+make demo-down           # terraform destroy — run this when demo is finished
+
+# Check what AWS resources are currently provisioned (if any = costs money)
+make demo-status         # terraform show
+
+# Reset the auto-destroy timer (prevents Lambda from tearing down a running demo)
+make demo-extend         # sends heartbeat to auto-destroy Lambda
+
+# Estimate cost of current Terraform plan
+make demo-cost           # terraform plan | count resources to be created
+
+# ── OpenAPI ────────────────────────────────────────────────────────────────
+# Regenerate and validate all committed OpenAPI specs
+make check-openapi       # scripts/generate_openapi.sh + git diff --exit-code
 ```
