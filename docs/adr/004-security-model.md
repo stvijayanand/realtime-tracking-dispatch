@@ -80,23 +80,121 @@ frontend-net:   dispatch (port 8080 only), rider-ui
 
 **Phase 2:** Kubernetes NetworkPolicy resources enforce the same isolation at the pod level. Egress is deny-by-default; only explicitly allowed routes are permitted.
 
-### Layer 3: Kafka Authorization — SASL/PLAIN (Phase 1)
+### Layer 3: Kafka Authentication and Authorization
 
-Apache Kafka (KRaft mode) supports SASL/PLAIN authentication. Each service gets its own credentials with topic-level ACLs.
+#### Phase 1 — Local docker-compose: SASL/PLAIN + PLAINTEXT
 
-**Per-service Kafka ACLs:**
+Local dev uses SASL/PLAIN over a plaintext connection. This is acceptable **only** because:
+- All traffic is on an isolated Docker bridge network with no external exposure
+- The risk model is fundamentally different from a networked environment
+- Adding TLS to local dev adds certificate management complexity with zero security benefit
 
-| Service | Allowed Operations |
-|---|---|
-| `ingest-service` | PRODUCE to `gps-pings` |
-| `dispatch-service` | PRODUCE to `ride-events`; CONSUME from `ride-events` |
-| `notification-service` | CONSUME from `ride-events` |
+Each service gets its own credentials with topic-level ACLs. No service has wildcard topic access.
 
-No service has wildcard topic access. A compromised Ingest Service cannot read ride events or produce to notification topics.
+**Per-service Kafka ACLs (Phase 1 — local):**
+
+| Service | Topic | Operations |
+|---|---|---|
+| `ingest-service` | `gps-pings` | `Write` |
+| `dispatch-service` | `ride-events` | `Read`, `Write` |
+| `dispatch-service` | `gps-pings` | `Read` |
+| `notification-service` | `ride-events` | `Read` |
+| `gateway-service` | `ride-events` | `Read` |
+| `kafka-admin` (init only) | `*` | `Create`, `Describe` (topic creation only, not shared with any service) |
 
 **Kafka superuser** (for topic creation at startup): a separate `admin` credential used only by the Kafka init container or topic-creation script. Not shared with any application service.
 
-**Phase 2:** Migrate to mTLS (mutual TLS) between services and Kafka. SASL/PLAIN is acceptable for the local dev environment; mTLS is required for staging and production.
+#### Phase 2 — EKS/Strimzi: SASL/SCRAM-SHA-512 + TLS (SASL_SSL)
+
+Production and demo deployments on EKS use **SASL/SCRAM-SHA-512 over TLS**. This satisfies all three production best practices:
+
+1. **Never SASL_PLAINTEXT in production**: The Strimzi listener uses `tls: true` — credentials and message payloads are encrypted in transit. A compromised pod cannot sniff credentials or data from other pods on the same node.
+
+2. **SCRAM-SHA-512 over PLAIN**: SCRAM uses a challenge-response protocol — the broker never sees the raw password, and the stored credential is a salted hash. Even if the Kafka log directory or internal file system is compromised, stored SCRAM credentials cannot be reversed to recover the original password. PLAIN transmits credentials as base64 and provides no such protection.
+
+3. **ACLs decouple authentication from authorization**: SASL proves identity; ACLs enforce what that identity is permitted to do. Each `KafkaUser` CRD defines both the authentication mechanism and the exact ACL rules — a service can only produce/consume the specific topics it owns.
+
+Strimzi manages TLS certificates automatically via its built-in CA. Clients receive a truststore Secret injected by the operator — no manual certificate management.
+
+**Strimzi Kafka listener configuration (Phase 2):**
+```yaml
+listeners:
+  - name: tls
+    port: 9093
+    type: internal
+    tls: true
+    authentication:
+      type: scram-sha-512
+```
+
+**Strimzi KafkaUser CRD with full ACL matrix (Phase 2):**
+```yaml
+# infra/k8s/kafka/users/ingest-service.yaml
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: ingest-service
+  labels:
+    strimzi.io/cluster: dispatch-cluster
+spec:
+  authentication:
+    type: scram-sha-512          # SCRAM, not PLAIN
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: gps-pings
+        operation: Write         # produce only — cannot read or write other topics
+```
+
+```yaml
+# infra/k8s/kafka/users/dispatch-service.yaml
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource: { type: topic, name: ride-events }
+        operation: Read
+      - resource: { type: topic, name: ride-events }
+        operation: Write
+      - resource: { type: topic, name: gps-pings }
+        operation: Read          # CQRS read model consumer only
+```
+
+```yaml
+# infra/k8s/kafka/users/notification-service.yaml
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource: { type: topic, name: ride-events }
+        operation: Read          # consume only — cannot produce
+```
+
+```yaml
+# infra/k8s/kafka/users/gateway-service.yaml
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource: { type: topic, name: ride-events }
+        operation: Read          # consume only — cannot produce
+```
+
+Strimzi generates the SCRAM credentials automatically and stores them as Kubernetes Secrets. Services read the credentials from the Secret (injected by Vault Agent or mounted directly).
+
+#### Phase 3 — mTLS (mutual TLS)
+
+Phase 3 replaces SCRAM-SHA-512 with **mTLS** — both the broker and the client present certificates. The broker authenticates the client by certificate, not by password. This eliminates the credential management problem entirely and is the strongest available option.
+
+Phase 3 requires a PKI infrastructure: cert-manager + Vault PKI secrets engine generating short-lived client certificates per service. Deferred until the platform has a dedicated SRE function.
 
 ### Layer 4: Transport Security (Phase 1 → Phase 2)
 
@@ -154,13 +252,15 @@ The Phase 1 skeleton has no authentication — it is a local dev tool, not expos
 | No secrets in source control | Secrets | **Phase 1** | `.env` gitignored, `.env.example` committed |
 | Per-service DB/Redis passwords | Secrets | **Phase 1** | `.env` variables, no shared credentials |
 | Docker network segmentation | Network | **Phase 1** | Named networks with per-service membership |
-| Kafka SASL/PLAIN per-service credentials | Kafka Auth | **Phase 1** | Kafka KRaft ACLs, per-service username/password |
+| Kafka SASL/PLAIN per-service credentials | Kafka Auth | **Phase 1 (local only)** | Docker-isolated network; PLAIN acceptable locally; per-service ACLs enforced |
+| Kafka SASL/SCRAM-SHA-512 + TLS (SASL_SSL) | Kafka Auth | **Phase 2 (EKS)** | Strimzi `KafkaUser` CRDs; SCRAM challenge-response; TLS-encrypted transport |
+| Kafka per-service ACLs (operation-level) | Kafka AuthZ | **Phase 2 (EKS)** | `KafkaUser` CRDs with explicit `Read`/`Write` per topic per service |
 | Non-root container users | Container | **Phase 1** | `USER` directive in all Dockerfiles |
 | Pinned base image digests | Container | **Phase 1** | Specific version tags, no `latest` |
 | Request body size cap (64 KB) | Input | **Phase 1** | FastAPI/Spring middleware |
 | Field length validation | Input | **Phase 1** | Request schema validation |
 | TLS termination at Gateway | Transport | Phase 2 | Gateway TLS, internal plaintext on private net |
-| mTLS to Kafka | Transport | Phase 2 | Kafka TLS listener |
+| mTLS to Kafka | Transport | Phase 3 | Kafka TLS listener; cert-manager + Vault PKI; client certificates per service |
 | JWT authentication | Auth | Phase 2 | Auth Service, Gateway validation |
 | Driver/rider identity binding | AuthZ | Phase 2 | JWT `sub` claim == request identity field |
 | Rate limiting | Input | Phase 2 | Token bucket at Gateway |
@@ -176,7 +276,8 @@ The Phase 1 skeleton has no authentication — it is a local dev tool, not expos
 |---|---|---|---|
 | No JWT authentication | Any process can post as any driver/rider | Yes — local dev only, not exposed to real users | Document clearly; block external access via network isolation |
 | Plaintext HTTP between containers | Traffic visible on Docker network | Yes — isolated Docker network, no external exposure | Phase 2 adds TLS |
-| SASL/PLAIN (not mTLS) to Kafka | Credentials transmitted in plaintext within Docker network | Yes — acceptable for local dev | Phase 2 migrates to mTLS |
+| SASL/PLAIN (not SCRAM) to Kafka | Credentials vulnerable to dictionary attack if log directory compromised | Yes — **local dev only**; EKS uses SCRAM-SHA-512 | Phase 2 (EKS) uses SCRAM-SHA-512 via Strimzi `KafkaUser` CRDs |
+| SASL_PLAINTEXT (no TLS) to Kafka | Credentials and payloads in plaintext on Docker network | Yes — **local dev only**; isolated Docker bridge network | Phase 2 (EKS) uses SASL_SSL (TLS-encrypted transport) |
 | No rate limiting | Simulator or test can flood the Ingest Service | Yes — controlled dev environment | Smoke test validates at 10 pings/sec only |
 
 ---
@@ -188,7 +289,12 @@ The Phase 1 skeleton has no authentication — it is a local dev tool, not expos
 | Secret leakage via source control | ✅ Yes | `.gitignore`, `.env.example` pattern |
 | Container escape / privilege escalation | ✅ Yes | Non-root users, no privileged containers |
 | Lateral movement between services | ✅ Yes | Docker network segmentation |
-| Unauthorized Kafka topic access | ✅ Yes | SASL/PLAIN ACLs per service |
+| Unauthorized Kafka topic access | ✅ Phase 1 (local) | SASL/PLAIN ACLs per service |
+| Unauthorized Kafka topic access | ✅ Phase 2 (EKS) | SCRAM-SHA-512 + operation-level ACLs via Strimzi `KafkaUser` CRDs |
+| Kafka credential interception | ❌ Phase 1 (local — accepted) | Isolated Docker network; no external exposure |
+| Kafka credential interception | ✅ Phase 2 (EKS) | SASL_SSL — TLS encrypts credentials and payloads in transit |
+| Kafka credential brute force / log compromise | ❌ Phase 1 (local — accepted) | SASL/PLAIN; local dev only |
+| Kafka credential brute force / log compromise | ✅ Phase 2 (EKS) | SCRAM-SHA-512 — salted hash; raw password never stored or transmitted |
 | GPS coordinate spoofing (driver impersonation) | ❌ Phase 2 | JWT identity binding |
 | Ride request flooding | ❌ Phase 2 | Rate limiting at Gateway |
 | Man-in-the-middle on internal traffic | ❌ Phase 2 | mTLS |
@@ -200,6 +306,8 @@ The Phase 1 skeleton has no authentication — it is a local dev tool, not expos
 
 - [OWASP API Security Top 10](https://owasp.org/www-project-api-security/)
 - [Apache Kafka Security — SASL/PLAIN](https://kafka.apache.org/documentation/#security_sasl_plain)
+- [Apache Kafka Security — SASL/SCRAM](https://kafka.apache.org/documentation/#security_sasl_scram)
+- [Strimzi KafkaUser CRD — SCRAM-SHA-512](https://strimzi.io/docs/operators/latest/configuring.html#type-KafkaUserScramSha512ClientAuthentication-reference)
 - [Docker Network Security](https://docs.docker.com/network/)
 - [JWT Best Practices — RFC 8725](https://www.rfc-editor.org/rfc/rfc8725)
 - [HashiCorp Vault](https://developer.hashicorp.com/vault)

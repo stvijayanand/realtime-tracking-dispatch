@@ -83,12 +83,12 @@ spec:
       size: 50Gi
       class: gp3
     listeners:
-      - name: plain
-        port: 9092
+      - name: tls
+        port: 9093
         type: internal
-        tls: false
+        tls: true
         authentication:
-          type: scram-sha-512
+          type: scram-sha-512    # SCRAM-SHA-512 over TLS (SASL_SSL) — never PLAIN over PLAINTEXT in production
 ```
 
 ```yaml
@@ -126,7 +126,27 @@ spec:
         operation: Write
 ```
 
-The `KAFKA_BOOTSTRAP_SERVERS` env var points to `dispatch-cluster-kafka-bootstrap:9092` — the Strimzi-managed Kubernetes Service. This is the only change from the local docker-compose config.
+```yaml
+# infra/k8s/kafka/users/ingest-service.yaml
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: ingest-service
+  labels:
+    strimzi.io/cluster: dispatch-cluster
+spec:
+  authentication:
+    type: scram-sha-512          # SCRAM-SHA-512 — salted hash; raw password never stored or transmitted
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: gps-pings
+        operation: Write         # produce only — cannot read or write any other topic
+```
+
+The `KAFKA_BOOTSTRAP_SERVERS` env var points to `dispatch-cluster-kafka-bootstrap:9093` (TLS port) — the Strimzi-managed Kubernetes Service. Services load the CA certificate from the Strimzi-generated Secret (injected by Vault Agent or mounted as a volume).
 
 #### RDS PostgreSQL
 - Use **Aurora Serverless v2** (`db.serverless`, PostgreSQL-compatible)

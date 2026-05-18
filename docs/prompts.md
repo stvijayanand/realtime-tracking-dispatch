@@ -77,6 +77,12 @@ Are you including idempotency?
 
 I'd like like security baked in from the start. How are you handling security?
 
+### SASL
+
+Production Best Practices Never use SASL_PLAINTEXT in Production: Always combine SASL with TLS (SASL_SSL) to shield both credentials and pipeline data from interception.Decouple with ACLs: Authentication via SASL only proves identity. Pair it with Access Control Lists (ACLs) to strictly enforce authorization rules (e.g., restricting a user to Read operations on a single topic).Prefer SCRAM-SHA-512 over PLAIN: For basic credential setups, SCRAM safeguards your underlying metadata logs from dictionary attacks even if internal file systems get compromised.
+What are your recommendations?
+
+
 ## Cross Context reads
 
 Querying data across multiple contexts synchronously can create cascading failures and latency spikes

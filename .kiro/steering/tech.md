@@ -187,13 +187,19 @@ Production systems are not observable by accident. OTel is instrumented from the
 
 - No secrets in source control — ever. `.env` gitignored, `.env.example` committed
 - Production secrets via HashiCorp Vault (Vault Agent sidecar or Vault SDK; AppRole / Kubernetes auth; dynamic secret rotation)
-- Each service has its own Kafka SASL credentials with ACLs restricted to only the topics it owns
+- **Kafka auth by phase**:
+  - Phase 1 (local docker-compose): SASL/PLAIN over PLAINTEXT — acceptable on isolated Docker bridge network only
+  - Phase 2 (EKS/Strimzi): SASL/SCRAM-SHA-512 over TLS (SASL_SSL) — SCRAM challenge-response protects credentials even if log directory is compromised; TLS encrypts credentials and payloads in transit
+  - Phase 3: mTLS — client certificates per service via cert-manager + Vault PKI; no passwords at all
+- Each service has its own Kafka credentials with ACLs restricted to the exact topics and operations it owns (principle of least privilege) — enforced via Strimzi `KafkaUser` CRDs on EKS
+- Never use SASL_PLAINTEXT in production — always combine SASL with TLS (SASL_SSL)
+- Prefer SCRAM-SHA-512 over PLAIN for any credential-based setup — SCRAM safeguards stored credentials from dictionary attacks even if internal file systems are compromised
 - Docker Compose named networks segment traffic: `kafka-net`, `db-net`, `frontend-net`
 - All Dockerfiles run as non-root users with pinned base image versions
 - All HTTP endpoints enforce 64 KB maximum request body size
 - Services fail fast with a descriptive error if a required environment variable is missing
-- Phase 2: mTLS between services and Kafka (Strimzi TLS listener); JWT auth at Gateway; rate limiting via Kong/ALB WAF
-- See `docs/adr/004-security-model.md` for the full security model and phase controls
+- Phase 2: JWT auth at Gateway; rate limiting via Kong/ALB WAF
+- See `docs/adr/004-security-model.md` for the full security model, Kafka auth phase progression, and threat model
 
 ## Common Commands
 
