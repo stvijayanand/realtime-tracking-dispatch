@@ -6,8 +6,8 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
 
 ## Tasks
 
-- [ ] 1. Monorepo scaffold, shared Avro schemas, and envelope types
-  - [ ] 1.1 Create top-level directory structure and root configuration files
+- [x] 1. Monorepo scaffold, shared Avro schemas, and envelope types
+  - [x] 1.1 Create top-level directory structure and root configuration files
     - Create `services/ingest/`, `services/dispatch/`, `services/notification/`, `services/tracking/`, `services/gateway/` directories
     - Create `infra/docker/`, `infra/k8s/`, `infra/kafka/`, `infra/terraform/` directories
     - Create `scripts/`, `shared/avro/`, `shared/envelope/`, `shared/proto/`, `docs/adr/`, `docs/query-plans/` directories
@@ -15,7 +15,7 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - Create root `Makefile` with targets: `build`, `test`, `lint`, `up`, `down`
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 10.1, 10.2_
 
-  - [ ] 1.2 Write Avro schemas for all Domain Events in `shared/avro/`
+  - [x] 1.2 Write Avro schemas for all Domain Events in `shared/avro/`
     - Write `shared/avro/location_ping_received.avsc` — envelope fields `event_id`, `event_type`, `occurred_at`, `payload` (with `driver_id`, `latitude`, `longitude`, `timestamp`)
     - Write `shared/avro/trip_requested.avsc` — envelope + payload (`trip_id`, `rider_id`, `pickup_location`, `requested_at`)
     - Write `shared/avro/trip_assigned.avsc` — envelope + payload (`trip_id`, `driver_id`, `rider_id`, `assigned_at`)
@@ -23,13 +23,13 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - All schemas must use the standard envelope structure; `event_type` is part of the schema contract (not a Kafka header)
     - _Requirements: 1.4, 2.2, 3.3, 3.17_
 
-  - [ ] 1.3 Implement Go shared envelope package (`shared/envelope/envelope.go`)
+  - [x] 1.3 Implement Go shared envelope package (`shared/envelope/envelope.go`)
     - Define `DomainEventEnvelope` struct with `avro` struct tags: `EventID`, `EventType`, `OccurredAt`, `Payload map[string]interface{}`
     - Implement `Validate(e DomainEventEnvelope) error` — checks `EventID` is a non-empty UUID string and `EventType` is non-empty; returns `EnvelopeValidationError` identifying the failing field
     - Do NOT place any domain types (`Trip`, `DriverLocation`, `Notification`) in `shared/`
     - _Requirements: 1.4_
 
-  - [ ] 1.4 Implement Java shared envelope type (`shared/KafkaEnvelope.java`)
+  - [x] 1.4 Implement Java shared envelope type (`shared/KafkaEnvelope.java`)
     - Define `KafkaEnvelope` as a Java `record` with fields: `eventId`, `eventType`, `occurredAt`, `payload Map<String,Object>`
     - Implement static factory `KafkaEnvelope.of(String eventType, Map<String,Object> payload)` that generates `eventId` (UUID4) and `occurredAt` (ISO 8601)
     - Add Javadoc noting this factory is for infrastructure-level use only; service-specific domain events use `EventEnvelopeFactory`
