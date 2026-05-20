@@ -94,8 +94,8 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - **Validates: Requirements 2.10, 10.8**
 
 
-- [ ] 3. Spring Boot Dispatch Service
-  - [ ] 3.1 Scaffold Dispatch Service project structure and domain model
+- [x] 3. Spring Boot Dispatch Service
+  - [x] 3.1 Scaffold Dispatch Service project structure and domain model
     - Initialise Spring Boot 3.x project at `services/dispatch/` with dependencies: `spring-boot-starter-web`, `spring-boot-starter-data-jpa`, `spring-kafka`, `io.confluent:kafka-avro-serializer`, `springdoc-openapi-starter-webmvc-ui`, `flyway-core`, `postgresql`, `opentelemetry-spring-boot-starter`, `jqwik` (test-only)
     - Implement `domain/TripStatus.java` enum: `REQUESTED`, `ASSIGNED`, `CANCELLED`; implement `assertCanTransitionTo(TripStatus next)` guard method using `VALID_TRANSITIONS` map; throw `IllegalStateTransitionException(this, next)` on invalid transition
     - Implement `domain/Trip.java` `@Entity`: fields `tripId` (UUID PK), `riderId` (VARCHAR 128), `driverId` (VARCHAR 128, nullable), `status` (VARCHAR 20), `pickupLat`, `pickupLng` (DOUBLE PRECISION), `requestedAt`, `assignedAt` (nullable), `updatedAt` (TIMESTAMPTZ DEFAULT now())
@@ -103,37 +103,37 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - Write Flyway migration `V1__create_trips_table.sql` in `src/main/resources/db/migration/`: CREATE TABLE trips + `idx_trips_status` + `idx_trips_updated_at` indexes; commit `EXPLAIN ANALYZE` output to `docs/query-plans/V1_trips_indexes.md`
     - _Requirements: 3.16, 3.17_
 
-  - [ ] 3.2 Implement Dispatch Service configuration and fail-fast startup
+  - [x] 3.2 Implement Dispatch Service configuration and fail-fast startup
     - Implement `config/AppConfig.java` `@Configuration`: `@PostConstruct validateRequiredEnvVars()` iterates required env var names (`KAFKA_BOOTSTRAP_SERVERS`, `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD`, `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD`, `SCHEMA_REGISTRY_URL`, `SERVICE_PORT`, `OTEL_EXPORTER_OTLP_ENDPOINT`) and throws `IllegalStateException` with the missing variable name if any are absent
     - Implement `config/KafkaConsumerConfig.java`: consumer factory beans for `ride-events` (`dispatch-consumer-group`) and `gps-pings` (`dispatch-location-group`); configure Avro deserialiser with Schema Registry URL; configure exponential backoff retry (up to 5 attempts) on startup connection failure
     - _Requirements: 3.5, 3.6, 10.10_
 
-  - [ ] 3.3 Implement Dispatch Service domain events and factory
+  - [x] 3.3 Implement Dispatch Service domain events and factory
     - Implement `events/DomainEventEnvelope.java` record: `eventId`, `eventType`, `occurredAt`, `payload Map<String,Object>`
     - Implement `events/TripRequestedPayload.java`, `TripAssignedPayload.java`, `TripCancelledPayload.java` records with all required fields
     - Implement `events/EventEnvelopeFactory.java` static factory: `buildTripRequested(UUID tripId, String riderId, PickupLocation pickup, Instant requestedAt)` and `buildTripAssigned(UUID tripId, String driverId, String riderId, Instant assignedAt)` — all UUID generation and timestamp generation isolated here; `DispatchService` never calls `UUID.randomUUID()` directly
     - _Requirements: 3.3, 3.4_
 
-  - [ ] 3.4 Implement Dispatch Service driver selection strategy and service layer
+  - [x] 3.4 Implement Dispatch Service driver selection strategy and service layer
     - Implement `service/DriverSelectionStrategy.java` interface: `String selectDriver(PickupLocation pickup)`
     - Implement `service/HardcodedDriverSelectionStrategy.java` `@Component`: static list `["driver-001", "driver-002", "driver-003"]`; round-robin via `AtomicInteger`; ignores `pickup` in Phase 1
     - Implement `service/DispatchService.java` `@Service`: `@Transactional requestRide(String riderId, PickupLocation pickup)` — generate `tripId`, persist `Trip(status=REQUESTED)`, build `TripRequested` envelope via `EventEnvelopeFactory`, publish to `ride-events`, return `tripId`; `@Transactional assignDriver(UUID tripId, String riderId)` — load Trip, call `status.assertCanTransitionTo(ASSIGNED)`, call `driverSelectionStrategy.selectDriver(pickup)`, update Trip, build `TripAssigned` envelope, publish to `ride-events`; Kafka producer configured with `acks=all`, `enable.idempotence=true`
     - _Requirements: 3.1, 3.2, 3.3, 3.7, 3.10_
 
-  - [ ] 3.5 Implement Dispatch Service Kafka consumers
+  - [x] 3.5 Implement Dispatch Service Kafka consumers
     - Implement `consumer/EnvelopeValidator.java` stateless validator: `static void validate(DomainEventEnvelope envelope)` — asserts `eventId` is non-empty UUID string and `eventType` is non-null/non-empty; throws `EnvelopeValidationException` with descriptive message on failure
     - Implement `consumer/RideEventsConsumer.java` `@KafkaListener` on `ride-events` topic, group `dispatch-consumer-group`: deserialise Avro → `DomainEventEnvelope`; filter `event_type == "TripRequested"` only; delegate to `dispatchService.assignDriver(tripId, riderId)`; must complete within 2 seconds; propagate W3C `traceparent` header from Kafka message headers to OTel span context
     - Implement `consumer/LocationPingConsumer.java` `@KafkaListener` on `gps-pings` topic, group `dispatch-location-group`: call `EnvelopeValidator.validate()`; log receipt at DEBUG level; on deserialisation failure or envelope validation failure: log WARNING to stderr, commit offset, continue; do NOT write to Redis in Phase 1
     - _Requirements: 3.1, 3.13, 3.14, 3.15, 12.1_
 
-  - [ ] 3.6 Implement Dispatch Service HTTP layer and OpenAPI
+  - [x] 3.6 Implement Dispatch Service HTTP layer and OpenAPI
     - Implement `web/dto/PickupLocation.java`, `RequestRideRequest.java` (record with `@Valid` annotations: `riderId` non-empty max 128, `pickupLocation` non-null), `RequestRideResponse.java` (record: `tripId UUID`)
     - Implement `web/RideController.java` `@RestController`: `POST /request-ride` — `@Valid` request body, enforce 64 KB body size limit (Spring `spring.servlet.multipart.max-request-size` or `@RequestBody` size filter), delegate to `dispatchService.requestRide()`, return `202 {"trip_id": tripId}`; return 413 for oversized body, 422 for validation failure
     - Implement `web/HealthController.java`: `GET /health` returning `200 {"status": "UP"}`
     - Configure `springdoc-openapi` to expose `/v3/api-docs`; auto-generate `services/dispatch/openapi.json` on startup
     - _Requirements: 3.4, 3.8, 3.9, 3.11, 10.8, 10.9_
 
-  - [ ] 3.7 Write Dispatch Service Dockerfile
+  - [x] 3.7 Write Dispatch Service Dockerfile
     - Write `infra/docker/dispatch.Dockerfile` (or `services/dispatch/Dockerfile`): `FROM eclipse-temurin:21-jre-jammy` (pinned version); add `RUN groupadd -r appuser && useradd -r -g appuser appuser`; `USER appuser`; copy JAR; `ENTRYPOINT ["java", "-jar", "app.jar"]`
     - _Requirements: 3.12, 10.6, 10.7_
 
