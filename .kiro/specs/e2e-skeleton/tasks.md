@@ -179,7 +179,7 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - **Validates: Requirements 10.10**
 
 
-- [ ] 4. Checkpoint — Ingest and Dispatch tests pass
+- [x] 4. Checkpoint — Ingest and Dispatch tests pass
   - Ensure all tests in `services/ingest/tests/` and `services/dispatch/src/test/java/` pass, ask the user if questions arise.
 
 - [ ] 5. Go Notification Service

@@ -35,9 +35,20 @@
         <dependency><groupId>com.h2database</groupId><artifactId>h2</artifactId><scope>test</scope></dependency>
     </dependencies>
     <repositories>
+        <!-- Maven Central must be listed first so Spring Boot parent POM resolves
+             from Central before Maven tries the Confluent repository. -->
+        <repository>
+            <id>central</id>
+            <url>https://repo.maven.apache.org/maven2</url>
+            <releases><enabled>true</enabled></releases>
+            <snapshots><enabled>false</enabled></snapshots>
+        </repository>
+        <!-- Confluent Schema Registry artifacts (kafka-avro-serializer etc.) -->
         <repository>
             <id>confluent</id>
             <url>https://packages.confluent.io/maven/</url>
+            <releases><enabled>true</enabled></releases>
+            <snapshots><enabled>false</enabled></snapshots>
         </repository>
     </repositories>
     <build>
