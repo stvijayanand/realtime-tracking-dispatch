@@ -182,36 +182,36 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
 - [x] 4. Checkpoint — Ingest and Dispatch tests pass
   - Ensure all tests in `services/ingest/tests/` and `services/dispatch/src/test/java/` pass, ask the user if questions arise.
 
-- [ ] 5. Go Notification Service
-  - [ ] 5.1 Scaffold Notification Service module structure and config
+- [x] 5. Go Notification Service
+  - [x] 5.1 Scaffold Notification Service module structure and config
     - Initialise Go module at `services/notification/` (`go mod init`)
     - Add dependencies: `github.com/confluentinc/confluent-kafka-go/v2`, `github.com/rs/zerolog` (or `log/slog`), `go.opentelemetry.io/otel`, `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`, `pgregory.net/rapid` (test-only), `github.com/stretchr/testify`
     - Implement `config/config.go`: `Config` struct with `KafkaBootstrapServers`, `KafkaTopic`, `KafkaSASLUsername`, `KafkaSASLPassword`, `KafkaConsumerGroupID`, `SchemaRegistryURL`, `ServicePort`, `OTELEndpoint`; `LoadConfig()` reads via `os.Getenv`; logs descriptive error identifying the missing variable and calls `os.Exit(1)` on any missing required var
     - _Requirements: 4.7, 10.10_
 
-  - [ ] 5.2 Implement Notification Service structured logger (`logger/logger.go`)
+  - [x] 5.2 Implement Notification Service structured logger (`logger/logger.go`)
     - Implement `logger.Logger` struct wrapping zerolog (or slog) configured to emit JSON to stdout
     - Implement `LogNotification(event events.TripAssignedEvent)` method — writes one JSON line with fields: `event_id`, `event_type`, `trip_id`, `driver_id`, `rider_id`, `assigned_at`, `notification_sent_at` (`time.Now().UTC()` ISO 8601), `trace_id` (extracted from OTel span context)
     - Implement `LogWarning(msg string, rawBytes []byte)` method — writes JSON warning line to stderr with `trace_id`
     - All log output MUST go through `Logger` methods — never `fmt.Println()` or raw `log` calls
     - _Requirements: 4.2, 12.3_
 
-  - [ ] 5.3 Implement Notification Service domain event parser (`events/trip_assigned.go`)
+  - [x] 5.3 Implement Notification Service domain event parser (`events/trip_assigned.go`)
     - Implement `TripAssignedEvent` struct with unexported fields: `eventID`, `eventType`, `tripID`, `driverID`, `riderID`, `assignedAt`
     - Implement accessor methods: `EventID()`, `TripID()`, `DriverID()`, `RiderID()`, `AssignedAt()`
     - Implement `ParseTripAssigned(envelope map[string]interface{}) (TripAssignedEvent, error)` — validates all required fields are present and non-empty; returns `EventParseError` (with field name) if any required field is absent; never returns a partially-constructed `TripAssignedEvent`
     - _Requirements: 4.2, 4.4_
 
-  - [ ] 5.4 Implement Notification Service handlers and consumer worker
+  - [x] 5.4 Implement Notification Service handlers and consumer worker
     - Implement `handler/trip_assigned.go`: `HandleTripAssigned(event events.TripAssignedEvent, log *logger.Logger)` — calls `log.LogNotification(event)`; `NoOpHandler` no-op `HandlerFunc` for all other event types
     - Implement `consumer/worker.go`: `HandlerFunc` type `func(envelope map[string]interface{})`; `Worker` struct with `consumer *confluent.Consumer`, `handlers map[string]HandlerFunc`, `stopCh chan struct{}`; `NewWorker(cfg config.Config, handlers map[string]HandlerFunc) (*Worker, error)` — configure consumer with SASL/PLAIN, Schema Registry Avro deserialiser; `Start()` launches `run()` goroutine; `Stop()` signals stop and waits; `run()` loop: `Poll()` → Avro deserialise → extract `event_type` → `handlers[eventType](envelope)` (fallback to `NoOpHandler`) → `CommitOffsets()`; on Avro deserialisation failure: call `log.LogWarning()` with raw bytes, commit offset, continue; extract W3C `traceparent` header from Kafka message headers to create child OTel span
     - _Requirements: 4.1, 4.3, 4.4, 4.8, 12.1_
 
-  - [ ] 5.5 Implement Notification Service main entrypoint and HTTP server
+  - [x] 5.5 Implement Notification Service main entrypoint and HTTP server
     - Implement `main.go`: initialise OTel tracer, call `config.LoadConfig()`, construct `logger.Logger`, build handler map `{"TripAssigned": HandleTripAssigned, "*": NoOpHandler}`, construct `consumer.NewWorker(cfg, handlers)`, call `worker.Start()`, start HTTP server on `cfg.ServicePort` with `GET /health` (200 `{"status":"ok"}`) and `GET /metrics` (Prometheus text format) routes, auto-generate OpenAPI spec to `services/notification/openapi.json` at startup, implement graceful shutdown on SIGTERM/SIGINT calling `worker.Stop()`
     - _Requirements: 4.5, 4.6, 4.7, 8.2, 12.2_
 
-  - [ ] 5.6 Write Notification Service Dockerfile
+  - [x] 5.6 Write Notification Service Dockerfile
     - Write `infra/docker/notification.Dockerfile` (or `services/notification/Dockerfile`): multi-stage — `FROM golang:1.22-alpine AS builder` with `CGO_ENABLED=0`; `FROM gcr.io/distroless/static-debian12` final stage; `USER nonroot:nonroot`; pinned versions, never `latest`
     - _Requirements: 4.9, 10.6, 10.7_
 

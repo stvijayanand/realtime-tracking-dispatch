@@ -1,0 +1,46 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Notification Service",
+    "version": "1.0.0",
+    "description": "Consumes TripAssigned Domain Events from Kafka and writes structured JSON notification log lines to stdout. Stdout is the correct output target for containerised services — the container runtime captures it and a log collector ships it to a centralised store."
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "operationId": "healthCheck",
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": {
+                    "status": { "type": "string", "example": "ok" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Prometheus metrics",
+        "operationId": "getMetrics",
+        "responses": {
+          "200": {
+            "description": "Prometheus text format metrics including Kafka consumer lag",
+            "content": {
+              "text/plain": { "schema": { "type": "string" } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
