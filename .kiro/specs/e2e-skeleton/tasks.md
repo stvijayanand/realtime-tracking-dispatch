@@ -36,35 +36,35 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - _Requirements: 1.4_
 
 
-- [ ] 2. Go Ingest Service
-  - [ ] 2.1 Scaffold Ingest Service module structure and config
+- [x] 2. Go Ingest Service
+  - [x] 2.1 Scaffold Ingest Service module structure and config
     - Initialise Go module at `services/ingest/` (`go mod init`)
     - Add dependencies: `github.com/go-chi/chi/v5`, `github.com/confluentinc/confluent-kafka-go/v2`, `github.com/go-playground/validator/v10`, `github.com/google/uuid`, `go.opentelemetry.io/otel`, `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`, `pgregory.net/rapid` (test-only)
     - Implement `config/config.go`: `Config` struct with fields `KafkaBootstrapServers`, `KafkaTopic`, `KafkaSASLUsername`, `KafkaSASLPassword`, `SchemaRegistryURL`, `ServicePort`, `OTELEndpoint`; implement `LoadConfig()` reading each via `os.Getenv`; log descriptive error identifying the missing variable and call `os.Exit(1)` if any required var is absent
     - _Requirements: 2.8, 10.10_
 
-  - [ ] 2.2 Implement Ingest Service domain model and event factory
+  - [x] 2.2 Implement Ingest Service domain model and event factory
     - Implement `model/gps_ping.go`: `GpsPingRequest` struct with `go-playground/validator` tags — `DriverID` (required, max=128), `Latitude` (required, min=-90, max=90), `Longitude` (required, min=-180, max=180), `Timestamp` (required)
     - Implement `events/location_ping.go`: `DomainEvent` struct; `BuildLocationPingEvent(ping model.GpsPingRequest) DomainEvent` factory — generates `EventID` (UUID4 via `github.com/google/uuid`), sets `EventType = "LocationPingReceived"`, sets `OccurredAt` to `time.Now().UTC()` ISO 8601, copies all ping fields into `Payload`; never returns an error
     - _Requirements: 2.1, 2.2_
 
-  - [ ] 2.3 Implement Ingest Service Kafka producer (`kafka/producer.go`)
+  - [x] 2.3 Implement Ingest Service Kafka producer (`kafka/producer.go`)
     - Implement `Producer` struct with fields `producer *confluent.Producer`, `schemaRegistryURL string`, `topic string`
     - Implement `NewProducer(cfg config.Config) (*Producer, error)` — configure with `acks=all`, `enable.idempotence=true`, SASL/PLAIN credentials from config
     - Implement `Publish(key string, event events.DomainEvent) (string, error)` — serialise event as Avro via Schema Registry client (register schema from `shared/avro/location_ping_received.avsc` on first publish), call `producer.Produce()`, flush; return `event_id` on success; return error on delivery failure (caller returns HTTP 503); inject `traceparent` W3C header into Kafka message headers
     - _Requirements: 2.2, 2.3, 2.9, 12.1_
 
-  - [ ] 2.4 Implement Ingest Service HTTP handlers and middleware
+  - [x] 2.4 Implement Ingest Service HTTP handlers and middleware
     - Implement `middleware/body_size.go`: `MaxBodySize(limit int64) func(http.Handler) http.Handler` — standard Go middleware that returns HTTP 413 if request body exceeds `limit` bytes before the handler is called; limit is 65536 (64 KB)
     - Implement `handler/health.go`: `GET /health` handler returning `200 {"status": "ok"}`
     - Implement `handler/location.go`: `LocationHandler` struct with `Producer *kafka.Producer` field (constructor injection — never instantiate producer inside handler body); `ServeHTTP` method: decode JSON → `GpsPingRequest`, validate struct tags (return 422 with structured error body on failure), call `BuildLocationPingEvent`, call `Producer.Publish(key=driver_id, event)`, return `202 {"message_id": event_id}` on success or `503` on Kafka error
     - _Requirements: 2.1, 2.3, 2.4, 2.5, 2.6, 2.10, 10.8, 10.9_
 
-  - [ ] 2.5 Implement Ingest Service main entrypoint with OTel and metrics
+  - [x] 2.5 Implement Ingest Service main entrypoint with OTel and metrics
     - Implement `main.go`: initialise OTel tracer (OTLP exporter to `OTEL_EXPORTER_OTLP_ENDPOINT`), call `config.LoadConfig()`, construct `kafka.NewProducer(cfg)`, construct `LocationHandler{Producer: p}`, build `chi` router with middleware chain (`MaxBodySize(65536)` → `otelhttp.NewHandler` → routes), register `GET /health` and `GET /metrics` (Prometheus text format) routes, start HTTP server on `cfg.ServicePort`, implement graceful shutdown on SIGTERM/SIGINT
     - _Requirements: 2.8, 2.12, 12.1, 12.2, 12.3_
 
-  - [ ] 2.6 Write Ingest Service Dockerfile
+  - [x] 2.6 Write Ingest Service Dockerfile
     - Write `infra/docker/ingest.Dockerfile` (or `services/ingest/Dockerfile`): multi-stage build — `FROM golang:1.22-alpine AS builder` compiles static binary with `CGO_ENABLED=0`; `FROM gcr.io/distroless/static-debian12` final stage copies only the binary; add `USER nonroot:nonroot` directive; use pinned digest versions, never `latest`
     - _Requirements: 2.11, 10.6, 10.7_
 

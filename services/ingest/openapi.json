@@ -1,0 +1,172 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Ingest Service",
+    "version": "1.0.0",
+    "description": "GPS ping ingestion service. Receives driver location updates and publishes LocationPingReceived Domain Events to Kafka."
+  },
+  "paths": {
+    "/location": {
+      "post": {
+        "summary": "Submit a GPS ping",
+        "operationId": "submitGpsPing",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GpsPingRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "GPS ping accepted and published to Kafka",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptedResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds 64 KB"
+          },
+          "422": {
+            "description": "Validation error — missing or invalid fields",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Kafka topic unavailable — GPS ping could not be published"
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "operationId": "healthCheck",
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Prometheus metrics",
+        "operationId": "getMetrics",
+        "responses": {
+          "200": {
+            "description": "Prometheus text format metrics",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "GpsPingRequest": {
+        "type": "object",
+        "required": ["driver_id", "latitude", "longitude", "timestamp"],
+        "properties": {
+          "driver_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Unique identifier for the driver emitting the GPS ping"
+          },
+          "latitude": {
+            "type": "number",
+            "format": "double",
+            "minimum": -90.0,
+            "maximum": 90.0,
+            "description": "WGS-84 latitude in decimal degrees"
+          },
+          "longitude": {
+            "type": "number",
+            "format": "double",
+            "minimum": -180.0,
+            "maximum": 180.0,
+            "description": "WGS-84 longitude in decimal degrees"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 timestamp of the GPS ping (device clock)"
+          }
+        }
+      },
+      "AcceptedResponse": {
+        "type": "object",
+        "required": ["message_id"],
+        "properties": {
+          "message_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the published LocationPingReceived Domain Event (equals event_id in the Kafka message)"
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "example": "ok"
+          }
+        }
+      },
+      "ValidationErrorDetail": {
+        "type": "object",
+        "required": ["field", "message"],
+        "properties": {
+          "field": {
+            "type": "string",
+            "description": "Name of the field that failed validation"
+          },
+          "message": {
+            "type": "string",
+            "description": "Validation rule that was violated"
+          }
+        }
+      },
+      "ValidationErrorResponse": {
+        "type": "object",
+        "required": ["detail"],
+        "properties": {
+          "detail": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ValidationErrorDetail"
+            }
+          }
+        }
+      }
+    }
+  }
+}
