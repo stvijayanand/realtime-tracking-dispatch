@@ -351,8 +351,8 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - Validate all three committed `openapi.json` files are valid OpenAPI 3.x (use `swagger-cli validate` or equivalent)
     - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6_
 
-- [ ] 11. Security baseline hardening
-  - [ ] 11.1 Audit and enforce security baseline across all services and docker-compose
+- [x] 11. Security baseline hardening
+  - [x] 11.1 Audit and enforce security baseline across all services and docker-compose
     - Verify `.env.example` documents every environment variable required by all services with placeholder values and inline comments explaining each variable's purpose; verify `.env` is in `.gitignore`
     - Verify `docker-compose.yml` uses `${VAR_NAME}` substitution for all credentials — no hardcoded passwords, usernames, or API keys anywhere in committed files
     - Verify Kafka SASL/PLAIN ACLs are defined in `infra/kafka/` restricting each service to only the topics it needs: `ingest` → produce `gps-pings`; `dispatch` → produce/consume `ride-events`, consume `gps-pings`; `notification` → consume `ride-events`; `gateway` → consume `ride-events`
