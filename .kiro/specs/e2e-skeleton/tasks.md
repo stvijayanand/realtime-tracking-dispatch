@@ -290,21 +290,21 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - **Property 11: Driver Simulator route looping**
     - **Validates: Requirements 5.6**
 
-- [ ] 8. Minimal React Rider UI
-  - [ ] 8.1 Scaffold Rider UI React application
+- [x] 8. Minimal React Rider UI
+  - [x] 8.1 Scaffold Rider UI React application
     - Initialise React 18 TypeScript app at `services/rider-ui/` using Create React App or Vite with TypeScript template
     - Add dependencies: `react-leaflet`, `leaflet`, `@types/leaflet`
     - Configure `REACT_APP_DISPATCH_URL` as a build-time environment variable (read from `.env` / `.env.example`)
     - _Requirements: 6.1, 6.6_
 
-  - [ ] 8.2 Implement Rider UI map and ride request flow
+  - [x] 8.2 Implement Rider UI map and ride request flow
     - Implement Leaflet map component centred on a default coordinate pair at city-scale zoom level
     - Implement "Request Ride" button: on click, POST to `${REACT_APP_DISPATCH_URL}/request-ride` with hardcoded `rider_id` and map centre as `pickup_location`
     - On HTTP 202: display returned `trip_id` on screen
     - On non-2xx response: display human-readable error message; do NOT leave the user with a blank or crashed page (use try/catch + error state)
     - _Requirements: 6.2, 6.3, 6.4, 6.5_
 
-  - [ ] 8.3 Write Rider UI Dockerfile
+  - [x] 8.3 Write Rider UI Dockerfile
     - Write `infra/docker/rider-ui.Dockerfile` (or `services/rider-ui/Dockerfile`): multi-stage — `FROM node:20.12-alpine AS builder` runs `npm ci && npm run build`; `FROM nginx:1.25-alpine` serves static build; pinned versions, never `latest`; non-root user
     - _Requirements: 6.6, 10.7_
 
