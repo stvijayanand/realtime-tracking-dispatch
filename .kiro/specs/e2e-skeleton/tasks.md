@@ -342,8 +342,8 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - _Requirements: 7.1, 7.8, 12.4, 12.5_
 
 
-- [ ] 10. OpenAPI spec generation and commit script
-  - [ ] 10.1 Implement OpenAPI spec generation and CI enforcement script
+- [x] 10. OpenAPI spec generation and commit script
+  - [x] 10.1 Implement OpenAPI spec generation and CI enforcement script
     - Verify `services/ingest/main.go` writes `services/ingest/openapi.json` at startup (auto-generated from handler registrations or a hand-authored spec matching the design)
     - Verify `services/notification/main.go` writes `services/notification/openapi.json` at startup
     - Write `scripts/generate_openapi.sh`: starts each Go service briefly (or uses a dedicated `--dump-openapi` flag), exports the spec, then stops the service; for Dispatch, calls `curl http://localhost:8080/v3/api-docs -o services/dispatch/openapi.json`
