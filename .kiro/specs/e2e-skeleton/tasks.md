@@ -232,27 +232,27 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - **Validates: Requirements 4.3**
 
 
-- [ ] 6. Go Gateway Service
-  - [ ] 6.1 Scaffold Gateway Service module structure and config
+- [x] 6. Go Gateway Service
+  - [x] 6.1 Scaffold Gateway Service module structure and config
     - Initialise Go module at `services/gateway/` (`go mod init`)
     - Add dependencies: `github.com/gorilla/websocket`, `github.com/confluentinc/confluent-kafka-go/v2`, `go.opentelemetry.io/otel`, `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`, `pgregory.net/rapid` (test-only), `github.com/stretchr/testify`
     - Implement `config/config.go`: `Config` struct with `KafkaBootstrapServers`, `KafkaTopic`, `KafkaSASLUsername`, `KafkaSASLPassword`, `KafkaConsumerGroupID`, `SchemaRegistryURL`, `ServicePort`, `OTELEndpoint`; `LoadConfig()` reads via `os.Getenv`; logs descriptive error identifying the missing variable and calls `os.Exit(1)` on any missing required var
     - _Requirements: 9.1, 10.10_
 
-  - [ ] 6.2 Implement Gateway Service session registry (`session/registry.go`)
+  - [x] 6.2 Implement Gateway Service session registry (`session/registry.go`)
     - Implement `Registry` struct with `mu sync.RWMutex` and `sessions map[string]*websocket.Conn` (Phase 1 in-memory; keyed by `rider_id`)
     - Implement `Register(riderID string, conn *websocket.Conn)` — acquires write lock, stores connection
     - Implement `Unregister(riderID string)` — acquires write lock, removes connection
     - Implement `Send(riderID string, payload []byte) error` — acquires read lock, looks up connection, calls `conn.WriteMessage(websocket.TextMessage, payload)`; returns error if rider not connected (no-op, not a crash)
     - _Requirements: 9.2, 9.4_
 
-  - [ ] 6.3 Implement Gateway Service WebSocket handler (`handler/websocket.go`)
+  - [x] 6.3 Implement Gateway Service WebSocket handler (`handler/websocket.go`)
     - Implement `WebSocketHandler` struct with `Registry *session.Registry` field (constructor injection)
     - Implement `ServeHTTP` for `GET /ws?rider_id=<string>`: validate `rider_id` query param (non-empty); upgrade HTTP connection using `gorilla/websocket` upgrader; call `registry.Register(riderID, conn)`; run read loop (heartbeat / ping-pong); on disconnect call `registry.Unregister(riderID)`
     - Implement `GET /health` handler returning `200 {"status": "ok"}`
     - _Requirements: 9.2, 9.5_
 
-  - [ ] 6.4 Implement Gateway Service Kafka consumer worker (`consumer/worker.go`)
+  - [x] 6.4 Implement Gateway Service Kafka consumer worker (`consumer/worker.go`)
     - Implement `Worker` struct with `consumer *confluent.Consumer`, `registry *session.Registry`, `stopCh chan struct{}`
     - Implement `NewWorker(cfg config.Config, registry *session.Registry) (*Worker, error)` — configure consumer with SASL/PLAIN, Schema Registry Avro deserialiser, consumer group `gateway-consumer-group`
     - Implement `Start()` / `Stop()` for graceful lifecycle management
@@ -260,11 +260,11 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - The Gateway does NOT fan out events — it translates one Kafka event to one WebSocket push for the specific connected rider
     - _Requirements: 9.1, 9.3, 9.4, 12.1_
 
-  - [ ] 6.5 Implement Gateway Service main entrypoint with OTel and metrics
+  - [x] 6.5 Implement Gateway Service main entrypoint with OTel and metrics
     - Implement `main.go`: initialise OTel tracer, call `config.LoadConfig()`, construct `session.Registry`, construct `consumer.NewWorker(cfg, registry)`, call `worker.Start()`, build `chi` (or `net/http`) router with `GET /ws` → `WebSocketHandler`, `GET /health`, `GET /metrics` (Prometheus text format including active WebSocket connection count gauge), start HTTP server on `cfg.ServicePort`, implement graceful shutdown on SIGTERM/SIGINT
     - _Requirements: 9.5, 12.2, 12.3_
 
-  - [ ] 6.6 Write Gateway Service Dockerfile
+  - [x] 6.6 Write Gateway Service Dockerfile
     - Write `infra/docker/gateway.Dockerfile` (or `services/gateway/Dockerfile`): multi-stage — `FROM golang:1.22-alpine AS builder` with `CGO_ENABLED=0`; `FROM gcr.io/distroless/static-debian12` final stage; `USER nonroot:nonroot`; pinned versions, never `latest`
     - _Requirements: 9.6, 10.6, 10.7_
 
