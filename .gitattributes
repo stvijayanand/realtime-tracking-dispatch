@@ -1,0 +1,8 @@
+*.java linguist-detectable=true
+
+# Ignore a specific third-party or vendor folder
+vendor/** linguist-vendored
+
+# Ignore auto-generated Go files (e.g., protobuf or mocks)
+*.pb.go linguist-generated
+*_mock.go linguist-generated
