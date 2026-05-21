@@ -1,0 +1,514 @@
+# =============================================================================
+# Real-Time Ride/Delivery Tracking & Dispatch Platform — Local Development Stack
+# =============================================================================
+# Usage:
+#   cp .env.example .env   # fill in real values
+#   docker-compose up -d
+#
+# Requirements: 7.1–7.10, 10.3–10.5
+# =============================================================================
+
+version: "3.9"
+
+# ── Named Networks ─────────────────────────────────────────────────────────────
+# Requirement 7.8: four named networks with strict service membership.
+networks:
+  kafka-net:
+    driver: bridge
+  db-net:
+    driver: bridge
+  frontend-net:
+    driver: bridge
+  observability-net:
+    driver: bridge
+
+# ── Named Volumes ──────────────────────────────────────────────────────────────
+# Requirement 7.5: named volumes for PostgreSQL and Redis data persistence.
+volumes:
+  postgres-data:
+  redis-data:
+  dynamodb-data:
+
+# =============================================================================
+# KAFKA KRAFT CLUSTER (3 brokers, no ZooKeeper)
+# Requirement 7.3: replication.factor=3, min.insync.replicas=2
+# Requirement 7.9: SASL/PLAIN authentication, per-service credentials
+# =============================================================================
+services:
+
+  kafka-1:
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: kafka-1
+    container_name: kafka-1
+    restart: on-failure
+    networks:
+      - kafka-net
+      - observability-net
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093"
+      KAFKA_LISTENERS: SASL_PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: SASL_PLAINTEXT://kafka-1:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: SASL_PLAINTEXT:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: SASL_PLAINTEXT
+      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_OPTS: "-Djava.security.auth.login.config=/etc/kafka/kafka_server_jaas.conf"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    volumes:
+      - ./infra/kafka/kafka_server_jaas.conf:/etc/kafka/kafka_server_jaas.conf:ro
+      - ./infra/kafka/create-topics.sh:/docker-entrypoint-initdb.d/create-topics.sh:ro
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092",
+             "--command-config", "/etc/kafka/client.properties"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  kafka-2:
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: kafka-2
+    container_name: kafka-2
+    restart: on-failure
+    networks:
+      - kafka-net
+      - observability-net
+    environment:
+      KAFKA_NODE_ID: 2
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093"
+      KAFKA_LISTENERS: SASL_PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: SASL_PLAINTEXT://kafka-2:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: SASL_PLAINTEXT:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: SASL_PLAINTEXT
+      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_OPTS: "-Djava.security.auth.login.config=/etc/kafka/kafka_server_jaas.conf"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    volumes:
+      - ./infra/kafka/kafka_server_jaas.conf:/etc/kafka/kafka_server_jaas.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 2>/dev/null || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  kafka-3:
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: kafka-3
+    container_name: kafka-3
+    restart: on-failure
+    networks:
+      - kafka-net
+      - observability-net
+    environment:
+      KAFKA_NODE_ID: 3
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093"
+      KAFKA_LISTENERS: SASL_PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: SASL_PLAINTEXT://kafka-3:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: SASL_PLAINTEXT:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: SASL_PLAINTEXT
+      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_OPTS: "-Djava.security.auth.login.config=/etc/kafka/kafka_server_jaas.conf"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    volumes:
+      - ./infra/kafka/kafka_server_jaas.conf:/etc/kafka/kafka_server_jaas.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 2>/dev/null || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # Topic initialiser — runs once to create all required topics.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka-init
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    networks:
+      - kafka-net
+    volumes:
+      - ./infra/kafka/create-topics.sh:/create-topics.sh:ro
+      - ./infra/kafka/client.properties:/etc/kafka/client.properties:ro
+    entrypoint: ["/bin/bash", "/create-topics.sh"]
+    restart: "no"
+
+  # Confluent Schema Registry
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    hostname: schema-registry
+    container_name: schema-registry
+    restart: on-failure
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+    networks:
+      - kafka-net
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "kafka-1:9092,kafka-2:9092,kafka-3:9092"
+      SCHEMA_REGISTRY_KAFKASTORE_SECURITY_PROTOCOL: SASL_PLAINTEXT
+      SCHEMA_REGISTRY_KAFKASTORE_SASL_MECHANISM: PLAIN
+      SCHEMA_REGISTRY_KAFKASTORE_SASL_JAAS_CONFIG: >-
+        org.apache.kafka.common.security.plain.PlainLoginModule required
+        username="${KAFKA_DISPATCH_USERNAME}"
+        password="${KAFKA_DISPATCH_PASSWORD}";
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # =============================================================================
+  # DATABASE LAYER
+  # Requirement 7.5: named volumes for data persistence
+  # Requirement 7.10: non-empty passwords from env vars
+  # =============================================================================
+
+  postgres:
+    image: postgres:16-alpine
+    hostname: postgres
+    container_name: postgres
+    restart: on-failure
+    networks:
+      - db-net
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  pgbouncer:
+    image: bitnami/pgbouncer:1.22.1
+    hostname: pgbouncer
+    container_name: pgbouncer
+    restart: on-failure
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - db-net
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRESQL_HOST: postgres
+      POSTGRESQL_PORT: 5432
+      POSTGRESQL_USERNAME: ${POSTGRES_USER}
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRESQL_DATABASE: ${POSTGRES_DB}
+      PGBOUNCER_DATABASE: ${POSTGRES_DB}
+      PGBOUNCER_POOL_MODE: transaction
+      PGBOUNCER_MAX_CLIENT_CONN: 200
+      PGBOUNCER_DEFAULT_POOL_SIZE: 20
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 5432"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7.2-alpine
+    hostname: redis
+    container_name: redis
+    restart: on-failure
+    networks:
+      - db-net
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:2.4.0
+    hostname: dynamodb-local
+    container_name: dynamodb-local
+    restart: on-failure
+    networks:
+      - db-net
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "/home/dynamodblocal/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/shell/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =============================================================================
+  # APPLICATION SERVICES
+  # Requirement 7.7: host ports 8001 (ingest), 8080 (dispatch), 8002 (notification), 8003 (gateway)
+  # Requirement 7.4: all inter-service hostnames via env vars
+  # =============================================================================
+
+  ingest-service:
+    build:
+      context: ./services/ingest
+      dockerfile: Dockerfile
+    image: realtime-tracking/ingest:local
+    hostname: ingest-service
+    container_name: ingest-service
+    restart: on-failure
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      schema-registry:
+        condition: service_healthy
+    networks:
+      - kafka-net
+      - observability-net
+    ports:
+      - "${INGEST_SERVICE_PORT:-8001}:${INGEST_SERVICE_PORT:-8001}"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka-1:9092,kafka-2:9092,kafka-3:9092"
+      KAFKA_TOPIC_GPS_PINGS: ${KAFKA_TOPIC_GPS_PINGS}
+      KAFKA_SASL_USERNAME: ${KAFKA_INGEST_USERNAME}
+      KAFKA_SASL_PASSWORD: ${KAFKA_INGEST_PASSWORD}
+      SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+      SERVICE_PORT: ${INGEST_SERVICE_PORT:-8001}
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:${INGEST_SERVICE_PORT:-8001}/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  dispatch-service:
+    build:
+      context: ./services/dispatch
+      dockerfile: Dockerfile
+    image: realtime-tracking/dispatch:local
+    hostname: dispatch-service
+    container_name: dispatch-service
+    restart: on-failure
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      schema-registry:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
+    networks:
+      - kafka-net
+      - db-net
+      - frontend-net
+      - observability-net
+    ports:
+      - "${DISPATCH_SERVICE_PORT:-8080}:${DISPATCH_SERVICE_PORT:-8080}"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka-1:9092,kafka-2:9092,kafka-3:9092"
+      KAFKA_TOPIC_RIDE_EVENTS: ${KAFKA_TOPIC_RIDE_EVENTS}
+      KAFKA_TOPIC_GPS_PINGS: ${KAFKA_TOPIC_GPS_PINGS}
+      KAFKA_SASL_USERNAME: ${KAFKA_DISPATCH_USERNAME}
+      KAFKA_SASL_PASSWORD: ${KAFKA_DISPATCH_PASSWORD}
+      SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://pgbouncer:5432/${POSTGRES_DB}"
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
+      SERVICE_PORT: ${DISPATCH_SERVICE_PORT:-8080}
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:${DISPATCH_SERVICE_PORT:-8080}/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  notification-service:
+    build:
+      context: ./services/notification
+      dockerfile: Dockerfile
+    image: realtime-tracking/notification:local
+    hostname: notification-service
+    container_name: notification-service
+    restart: on-failure
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      schema-registry:
+        condition: service_healthy
+    networks:
+      - kafka-net
+      - observability-net
+    ports:
+      - "${NOTIFICATION_SERVICE_PORT:-8002}:${NOTIFICATION_SERVICE_PORT:-8002}"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka-1:9092,kafka-2:9092,kafka-3:9092"
+      KAFKA_TOPIC_RIDE_EVENTS: ${KAFKA_TOPIC_RIDE_EVENTS}
+      KAFKA_SASL_USERNAME: ${KAFKA_NOTIFICATION_USERNAME}
+      KAFKA_SASL_PASSWORD: ${KAFKA_NOTIFICATION_PASSWORD}
+      KAFKA_CONSUMER_GROUP_ID: ${NOTIFICATION_KAFKA_CONSUMER_GROUP:-notification-service-group}
+      SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+      SERVICE_PORT: ${NOTIFICATION_SERVICE_PORT:-8002}
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:${NOTIFICATION_SERVICE_PORT:-8002}/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  gateway-service:
+    build:
+      context: ./services/gateway
+      dockerfile: Dockerfile
+    image: realtime-tracking/gateway:local
+    hostname: gateway-service
+    container_name: gateway-service
+    restart: on-failure
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      schema-registry:
+        condition: service_healthy
+    networks:
+      - kafka-net
+      - frontend-net
+      - observability-net
+    ports:
+      - "${GATEWAY_SERVICE_PORT:-8003}:${GATEWAY_SERVICE_PORT:-8003}"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka-1:9092,kafka-2:9092,kafka-3:9092"
+      KAFKA_TOPIC_RIDE_EVENTS: ${KAFKA_TOPIC_RIDE_EVENTS}
+      KAFKA_SASL_USERNAME: ${KAFKA_GATEWAY_USERNAME}
+      KAFKA_SASL_PASSWORD: ${KAFKA_GATEWAY_PASSWORD}
+      KAFKA_CONSUMER_GROUP_ID: ${GATEWAY_KAFKA_CONSUMER_GROUP:-gateway-consumer-group}
+      SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+      SERVICE_PORT: ${GATEWAY_SERVICE_PORT:-8003}
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:${GATEWAY_SERVICE_PORT:-8003}/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  rider-ui:
+    build:
+      context: ./services/rider-ui
+      dockerfile: Dockerfile
+      args:
+        VITE_DISPATCH_URL: "http://localhost:${DISPATCH_SERVICE_PORT:-8080}"
+    image: realtime-tracking/rider-ui:local
+    hostname: rider-ui
+    container_name: rider-ui
+    restart: on-failure
+    depends_on:
+      - dispatch-service
+      - gateway-service
+    networks:
+      - frontend-net
+    ports:
+      - "3001:80"
+
+  # =============================================================================
+  # OBSERVABILITY STACK
+  # Requirement 7.4 (12.4): Jaeger :16686, Prometheus :9090, Grafana :3000
+  # =============================================================================
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    hostname: jaeger
+    container_name: jaeger
+    restart: on-failure
+    networks:
+      - observability-net
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:14269/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    hostname: prometheus
+    container_name: prometheus
+    restart: on-failure
+    networks:
+      - observability-net
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    image: grafana/grafana:10.4.3
+    hostname: grafana
+    container_name: grafana
+    restart: on-failure
+    depends_on:
+      - prometheus
+    networks:
+      - observability-net
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./infra/docker/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

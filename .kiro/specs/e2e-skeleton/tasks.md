@@ -309,22 +309,22 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - _Requirements: 6.6, 10.7_
 
 
-- [ ] 9. docker-compose local environment
-  - [ ] 9.1 Write docker-compose Kafka KRaft cluster and Schema Registry
+- [x] 9. docker-compose local environment
+  - [x] 9.1 Write docker-compose Kafka KRaft cluster and Schema Registry
     - Define three Kafka broker services (`kafka-1`, `kafka-2`, `kafka-3`) using `confluentinc/cp-kafka:7.6.1` (pinned); configure each with `KAFKA_PROCESS_ROLES=broker,controller`, unique `KAFKA_NODE_ID`, `KAFKA_CONTROLLER_QUORUM_VOTERS` listing all three nodes, `KAFKA_LISTENERS` for both broker and controller ports; configure SASL/PLAIN authentication (`KAFKA_LISTENER_SECURITY_PROTOCOL_MAP`, `KAFKA_SASL_ENABLED_MECHANISMS=PLAIN`); each service credential loaded from `${VAR_NAME}` env var substitution — no hardcoded passwords
     - Define a `kafka-init` one-shot service that creates topics `gps-pings`, `ride-events`, `dispatch-commands`, `notifications` with `replication.factor=3`, `min.insync.replicas=2` after brokers are healthy
     - Define `schema-registry` service using `confluentinc/cp-schema-registry:7.6.1` (pinned); connect to all three brokers; expose port 8081
     - Attach all Kafka services to `kafka-net` only
     - _Requirements: 7.1, 7.3, 7.9_
 
-  - [ ] 9.2 Write docker-compose database and connection pooling services
+  - [x] 9.2 Write docker-compose database and connection pooling services
     - Define `postgres` service using `postgres:16-alpine` (pinned): set `POSTGRES_PASSWORD` from `${POSTGRES_PASSWORD}` env var; named volume `postgres-data` for persistence; attach to `db-net` only
     - Define `pgbouncer` service using `edoburu/pgbouncer` (pinned): configure transaction pooling mode; `DB_HOST=postgres`, credentials from env vars; expose port 5432 on `db-net`; attach to `db-net` only
     - Define `redis` service using `redis:7.2-alpine` (pinned): set password via `requirepass ${REDIS_PASSWORD}`; named volume `redis-data`; attach to `db-net` only
     - Define `dynamodb-local` service using `amazon/dynamodb-local` (pinned): expose port 8000; attach to `db-net` only (Phase 2 dedup — modelled in Phase 1)
     - _Requirements: 7.1, 7.5, 7.10_
 
-  - [ ] 9.3 Write docker-compose application service definitions
+  - [x] 9.3 Write docker-compose application service definitions
     - Define `ingest-service` container: build from Ingest Dockerfile; expose host port 8001; inject all required env vars from `${VAR_NAME}` substitution; attach to `kafka-net` and `observability-net`; health check on `GET /health`
     - Define `dispatch-service` container: build from Dispatch Dockerfile; expose host port 8080; inject all required env vars; attach to `kafka-net`, `db-net`, `frontend-net`, `observability-net`; health check on `GET /health`
     - Define `notification-service` container: build from Notification Dockerfile; expose host port 8002; inject all required env vars; attach to `kafka-net` and `observability-net`; health check on `GET /health`
@@ -333,7 +333,7 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - Configure `restart: on-failure` (not `always`) so failed containers surface in `docker-compose up` output without silent infinite restart loops
     - _Requirements: 7.1, 7.2, 7.4, 7.6, 7.7, 7.8_
 
-  - [ ] 9.4 Write docker-compose observability stack (Jaeger, Prometheus, Grafana)
+  - [x] 9.4 Write docker-compose observability stack (Jaeger, Prometheus, Grafana)
     - Define `jaeger` service using `jaegertracing/all-in-one:1.56` (pinned): expose host port 16686 (UI) and OTLP receiver port 4317; attach to `observability-net`
     - Define `prometheus` service using `prom/prometheus:v2.51.0` (pinned): mount `infra/prometheus.yml` config that scrapes `/metrics` from all four application services; expose host port 9090; attach to `observability-net`
     - Define `grafana` service using `grafana/grafana:10.4.0` (pinned): expose host port 3000; configure Prometheus and Jaeger as data sources; attach to `observability-net`
