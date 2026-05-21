@@ -269,8 +269,8 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - _Requirements: 9.6, 10.6, 10.7_
 
 
-- [ ] 7. Driver Simulator script (Python)
-  - [ ] 7.1 Implement Driver Simulator script and sample route
+- [x] 7. Driver Simulator script (Python)
+  - [x] 7.1 Implement Driver Simulator script and sample route
     - Write `scripts/simulate_driver.py` (Python 3.11, stdlib + `requests` only):
       - Accept CLI args: `--driver-id` (string), `--route-file` (path to GeoJSON LineString), `--rate` (pings/sec, default 10), `--ingest-url` (base URL)
       - Read and parse GeoJSON LineString from `--route-file`; exit non-zero with stderr error if file not found or not a valid GeoJSON LineString
