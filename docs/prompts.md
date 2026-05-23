@@ -123,7 +123,7 @@ I have asked you to move from Redpanda to Kafka + KRaft because I want to build 
 
 ### Goal clarification
 
-I doon't want this project to be a black box to me. I want to learn how to build FAANG scale, production-grade, real-world distributed systems and be able to demonstrate them. So, please tell me how I can run this project? Please give me a list of dependencies I need to imstall and configurations I need to make.
+I doon't want this project to be a black box to me. I want to learn how to build FAANG scale, production-grade, real-world distributed systems and be able to demonstrate them. So, please tell me how I can run this project end to end? Please give me a list of dependencies I need to imstall and configurations I need to make.
 By the way, Java is already installed in this machine.
 
 ### Adding more technologies
