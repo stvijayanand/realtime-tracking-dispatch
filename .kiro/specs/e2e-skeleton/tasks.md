@@ -6,7 +6,7 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
 
 ## Tasks
 
-- [x] 1. Monorepo scaffold, shared Avro schemas, and envelope types
+- [ ] 1. Monorepo scaffold, shared Avro schemas, and envelope types
   - [x] 1.1 Create top-level directory structure and root configuration files
     - Create `services/ingest/`, `services/dispatch/`, `services/notification/`, `services/tracking/`, `services/gateway/` directories
     - Create `infra/docker/`, `infra/k8s/`, `infra/kafka/`, `infra/terraform/` directories
@@ -15,7 +15,7 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - Create root `Makefile` with targets: `build`, `test`, `lint`, `up`, `down`
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 10.1, 10.2_
 
-  - [x] 1.2 Write Avro schemas for all Domain Events in `shared/avro/`
+  - [ ] 1.2 Write Avro schemas for all Domain Events in `shared/avro/`
     - Write `shared/avro/location_ping_received.avsc` — envelope fields `event_id`, `event_type`, `occurred_at`, `payload` (with `driver_id`, `latitude`, `longitude`, `timestamp`)
     - Write `shared/avro/trip_requested.avsc` — envelope + payload (`trip_id`, `rider_id`, `pickup_location`, `requested_at`)
     - Write `shared/avro/trip_assigned.avsc` — envelope + payload (`trip_id`, `driver_id`, `rider_id`, `assigned_at`)
@@ -23,7 +23,7 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - All schemas must use the standard envelope structure; `event_type` is part of the schema contract (not a Kafka header)
     - _Requirements: 1.4, 2.2, 3.3, 3.17_
 
-  - [x] 1.3 Implement Go shared envelope package (`shared/envelope/envelope.go`)
+  - [ ] 1.3 Implement Go shared envelope package (`shared/envelope/envelope.go`)
     - Define `DomainEventEnvelope` struct with `avro` struct tags: `EventID`, `EventType`, `OccurredAt`, `Payload map[string]interface{}`
     - Implement `Validate(e DomainEventEnvelope) error` — checks `EventID` is a non-empty UUID string and `EventType` is non-empty; returns `EnvelopeValidationError` identifying the failing field
     - Do NOT place any domain types (`Trip`, `DriverLocation`, `Notification`) in `shared/`
@@ -361,11 +361,11 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
     - Verify `driver_id` and `rider_id` validation (non-empty, max 128 chars) is enforced in Ingest Service (`go-playground/validator` tags) and Dispatch Service (`@Valid` annotations)
     - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.9_
 
-- [ ] 12. Checkpoint — All service tests pass, docker-compose starts cleanly
+- [x] 12. Checkpoint — All service tests pass, docker-compose starts cleanly
   - Ensure all tests in `services/ingest/tests/`, `services/dispatch/src/test/java/`, and `services/notification/tests/` pass; ensure `docker-compose up` reaches a healthy state with all services passing health checks within 120 seconds; ask the user if questions arise.
 
-- [ ] 13. Smoke test and e2e validation
-  - [ ] 13.1 Write smoke test script (`scripts/smoke_test.sh`)
+- [x] 13. Smoke test and e2e validation
+  - [x] 13.1 Write smoke test script (`scripts/smoke_test.sh`)
     - Write `scripts/smoke_test.sh` (bash):
       1. Start Driver Simulator (`python scripts/simulate_driver.py --driver-id smoke-driver-001 --route-file scripts/sample_route.geojson --rate 10 --ingest-url http://localhost:8001`) for 5 seconds; capture PID and kill after 5 seconds
       2. Submit one Ride Request: `curl -s -X POST http://localhost:8080/request-ride -H 'Content-Type: application/json' -d '{"rider_id":"smoke-rider-001","pickup_location":{"latitude":37.7749,"longitude":-122.4194}}'`; capture `trip_id` from JSON response
@@ -374,11 +374,11 @@ This plan converts the e2e-skeleton design into incremental coding tasks that bu
       5. On timeout: print diagnostic message identifying which pipeline stage did not produce output (check Ingest logs, Dispatch logs, Notification logs in sequence), exit non-zero
     - _Requirements: 11.1, 11.2, 11.4, 11.5_
 
-  - [ ] 13.2 Write sustained throughput validation
+  - [x] 13.2 Write sustained throughput validation
     - Extend `scripts/smoke_test.sh` or write `scripts/throughput_test.sh`: run Driver Simulator at 10 pings/second for 5 seconds; assert zero HTTP 5xx responses from Ingest Service during the run (parse simulator stderr for error lines); exit non-zero if any 5xx is observed
     - _Requirements: 11.3_
 
-- [ ] 14. Final checkpoint — Ensure all tests pass
+- [x] 14. Final checkpoint — Ensure all tests pass
   - Ensure all tests pass across all services, `docker-compose up` starts cleanly, `scripts/smoke_test.sh` exits 0, and `make check-openapi` exits 0; ask the user if questions arise.
 
 

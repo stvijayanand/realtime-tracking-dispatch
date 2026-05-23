@@ -121,6 +121,11 @@ I'd like to use Kafka with Kraft, instead. Please update. everywhere.
 
 I have asked you to move from Redpanda to Kafka + KRaft because I want to build FAANG scale, production-grade, real-world distributed systems that I can demonstrate. I want you to keep this in mind and suggest better technologies/design wherever you see fit. Make the suggestions ongoing as we build iteratively.
 
+### Goal clarification
+
+I doon't want this project to be a black box to me. I want to learn how to build FAANG scale, production-grade, real-world distributed systems and be able to demonstrate them. So, please tell me how I can run this project? Please give me a list of dependencies I need to imstall and configurations I need to make.
+By the way, Java is already installed in this machine.
+
 ### Adding more technologies
 
 Yes I’d like you to add this clarification to the changes you have recommended to improve the current stack to FAANG-scale production. One change I want to make is AWS secret manager instead of Hashicorp Vault. Also I would like to appropriately fit the following backend competencies into our design: ├── Event Streaming: Apache Kafka, AWS Kinesis ├── Containerization: Docker, Kubernetes, AWS EKS └── Data Storage: PostgreSQL (Query Optimization), Redis, DynamoDB
