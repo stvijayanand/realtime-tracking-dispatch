@@ -16,19 +16,22 @@
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
 FROM eclipse-temurin:21-jdk-jammy AS builder
 
+# Install Maven directly — avoids the Maven wrapper downloading Maven at build
+# time, which fails behind corporate SSL proxies.
+RUN apt-get update -qq && apt-get install -y --no-install-recommends maven && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /build
 
-# Copy Maven wrapper and POM first to leverage Docker layer caching.
-COPY mvnw mvnw
-COPY .mvn .mvn
+# Copy POM first to leverage Docker layer caching for dependency downloads.
 COPY pom.xml pom.xml
+COPY .mvn .mvn
 
 # Download dependencies (cached layer — only re-runs when pom.xml changes).
-RUN ./mvnw dependency:go-offline -B --no-transfer-progress
+RUN mvn dependency:go-offline -B --no-transfer-progress
 
 # Copy source code and build the JAR.
 COPY src src
-RUN ./mvnw package -DskipTests -B --no-transfer-progress
+RUN mvn package -DskipTests -B --no-transfer-progress
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 # eclipse-temurin:21-jre-jammy — pinned version, not 'latest'.

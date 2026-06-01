@@ -33,42 +33,12 @@ public class LocationPingConsumer {
     )
     public void onMessage(ConsumerRecord<String, Object> record) {
         try {
-            if (!(record.value() instanceof Map)) {
-                log.warn("Received non-map message on gps-pings, skipping. offset={}",
-                    record.offset());
-                return;
-            }
+            // Phase 1: Ingest publishes plain JSON strings (not Avro Maps).
+            // Log at DEBUG only — this fires at 10+ pings/sec per driver.
+            // Phase 2: parse JSON, validate envelope, write to Redis GEOADD.
+            log.debug("LocationPingReceived stub: offset={} key={}", record.offset(), record.key());
 
-            @SuppressWarnings("unchecked")
-            Map<String, Object> raw = (Map<String, Object>) record.value();
-
-            // Build a DomainEventEnvelope for validation.
-            String eventId   = (String) raw.get("event_id");
-            String eventType = (String) raw.get("event_type");
-
-            @SuppressWarnings("unchecked")
-            Map<String, Object> payload = raw.get("payload") instanceof Map
-                ? (Map<String, Object>) raw.get("payload")
-                : null;
-
-            DomainEventEnvelope envelope = new DomainEventEnvelope(
-                eventId, eventType, (String) raw.get("occurred_at"), payload);
-
-            // Validate envelope — throws EnvelopeValidationException on failure.
-            EnvelopeValidator.validate(envelope);
-
-            // Phase 1: log at DEBUG level only.
-            // Phase 2: call redisTemplate.opsForGeo().add(...) here.
-            log.debug("LocationPingReceived: eventId={} driverId={}",
-                envelope.eventId(),
-                payload != null ? payload.get("driver_id") : "unknown");
-
-        } catch (EnvelopeValidationException e) {
-            // Log warning and continue — do not crash the consumer (Requirement 3.15).
-            log.warn("Envelope validation failed on gps-pings: {} offset={}",
-                e.getMessage(), record.offset());
         } catch (Exception e) {
-            // Catch-all for deserialisation or unexpected errors.
             log.warn("Failed to process gps-pings message at offset={}: {}",
                 record.offset(), e.getMessage());
         }

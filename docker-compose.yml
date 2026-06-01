@@ -8,8 +8,6 @@
 # Requirements: 7.1–7.10, 10.3–10.5
 # =============================================================================
 
-version: "3.9"
-
 # ── Named Networks ─────────────────────────────────────────────────────────────
 # Requirement 7.8: four named networks with strict service membership.
 networks:
@@ -44,6 +42,7 @@ services:
     networks:
       - kafka-net
       - observability-net
+    entrypoint: ["/bin/bash", "/etc/kafka/kafka-entrypoint.sh"]
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -62,12 +61,17 @@ services:
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_ADMIN_PASSWORD: ${KAFKA_ADMIN_PASSWORD}
+      KAFKA_INGEST_PASSWORD: ${KAFKA_INGEST_PASSWORD}
+      KAFKA_DISPATCH_PASSWORD: ${KAFKA_DISPATCH_PASSWORD}
+      KAFKA_NOTIFICATION_PASSWORD: ${KAFKA_NOTIFICATION_PASSWORD}
+      KAFKA_GATEWAY_PASSWORD: ${KAFKA_GATEWAY_PASSWORD}
+      KAFKA_TRACKING_PASSWORD: ${KAFKA_TRACKING_PASSWORD}
     volumes:
-      - ./infra/kafka/kafka_server_jaas.conf:/etc/kafka/kafka_server_jaas.conf:ro
+      - ./infra/kafka/kafka-entrypoint.sh:/etc/kafka/kafka-entrypoint.sh:ro
       - ./infra/kafka/create-topics.sh:/docker-entrypoint-initdb.d/create-topics.sh:ro
     healthcheck:
-      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092",
-             "--command-config", "/etc/kafka/client.properties"]
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 --command-config /etc/kafka/client.properties 2>/dev/null || exit 1"]
       interval: 10s
       timeout: 10s
       retries: 10
@@ -81,6 +85,7 @@ services:
     networks:
       - kafka-net
       - observability-net
+    entrypoint: ["/bin/bash", "/etc/kafka/kafka-entrypoint.sh"]
     environment:
       KAFKA_NODE_ID: 2
       KAFKA_PROCESS_ROLES: broker,controller
@@ -99,10 +104,16 @@ services:
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_ADMIN_PASSWORD: ${KAFKA_ADMIN_PASSWORD}
+      KAFKA_INGEST_PASSWORD: ${KAFKA_INGEST_PASSWORD}
+      KAFKA_DISPATCH_PASSWORD: ${KAFKA_DISPATCH_PASSWORD}
+      KAFKA_NOTIFICATION_PASSWORD: ${KAFKA_NOTIFICATION_PASSWORD}
+      KAFKA_GATEWAY_PASSWORD: ${KAFKA_GATEWAY_PASSWORD}
+      KAFKA_TRACKING_PASSWORD: ${KAFKA_TRACKING_PASSWORD}
     volumes:
-      - ./infra/kafka/kafka_server_jaas.conf:/etc/kafka/kafka_server_jaas.conf:ro
+      - ./infra/kafka/kafka-entrypoint.sh:/etc/kafka/kafka-entrypoint.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 2>/dev/null || exit 1"]
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 --command-config /etc/kafka/client.properties 2>/dev/null || exit 1"]
       interval: 10s
       timeout: 10s
       retries: 10
@@ -116,6 +127,7 @@ services:
     networks:
       - kafka-net
       - observability-net
+    entrypoint: ["/bin/bash", "/etc/kafka/kafka-entrypoint.sh"]
     environment:
       KAFKA_NODE_ID: 3
       KAFKA_PROCESS_ROLES: broker,controller
@@ -134,10 +146,16 @@ services:
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_ADMIN_PASSWORD: ${KAFKA_ADMIN_PASSWORD}
+      KAFKA_INGEST_PASSWORD: ${KAFKA_INGEST_PASSWORD}
+      KAFKA_DISPATCH_PASSWORD: ${KAFKA_DISPATCH_PASSWORD}
+      KAFKA_NOTIFICATION_PASSWORD: ${KAFKA_NOTIFICATION_PASSWORD}
+      KAFKA_GATEWAY_PASSWORD: ${KAFKA_GATEWAY_PASSWORD}
+      KAFKA_TRACKING_PASSWORD: ${KAFKA_TRACKING_PASSWORD}
     volumes:
-      - ./infra/kafka/kafka_server_jaas.conf:/etc/kafka/kafka_server_jaas.conf:ro
+      - ./infra/kafka/kafka-entrypoint.sh:/etc/kafka/kafka-entrypoint.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 2>/dev/null || exit 1"]
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 --command-config /etc/kafka/client.properties 2>/dev/null || exit 1"]
       interval: 10s
       timeout: 10s
       retries: 10
@@ -156,10 +174,12 @@ services:
         condition: service_healthy
     networks:
       - kafka-net
+    environment:
+      KAFKA_ADMIN_PASSWORD: ${KAFKA_ADMIN_PASSWORD}
     volumes:
       - ./infra/kafka/create-topics.sh:/create-topics.sh:ro
-      - ./infra/kafka/client.properties:/etc/kafka/client.properties:ro
-    entrypoint: ["/bin/bash", "/create-topics.sh"]
+      - ./infra/kafka/kafka-init-entrypoint.sh:/kafka-init-entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/kafka-init-entrypoint.sh"]
     restart: "no"
 
   # Confluent Schema Registry
@@ -219,7 +239,7 @@ services:
       start_period: 10s
 
   pgbouncer:
-    image: bitnami/pgbouncer:1.22.1
+    image: edoburu/pgbouncer@sha256:85d1e38593617af1b5f7f285e97d407e56c29939683cc7cfe4c8f6dc19f1268b
     hostname: pgbouncer
     container_name: pgbouncer
     restart: on-failure
@@ -231,15 +251,15 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRESQL_HOST: postgres
-      POSTGRESQL_PORT: 5432
-      POSTGRESQL_USERNAME: ${POSTGRES_USER}
-      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRESQL_DATABASE: ${POSTGRES_DB}
-      PGBOUNCER_DATABASE: ${POSTGRES_DB}
-      PGBOUNCER_POOL_MODE: transaction
-      PGBOUNCER_MAX_CLIENT_CONN: 200
-      PGBOUNCER_DEFAULT_POOL_SIZE: 20
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 200
+      DEFAULT_POOL_SIZE: 20
+      AUTH_TYPE: scram-sha-256
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h localhost -p 5432"]
       interval: 5s

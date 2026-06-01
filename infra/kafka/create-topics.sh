@@ -4,7 +4,7 @@
 set -e
 
 BOOTSTRAP="kafka-1:9092,kafka-2:9092,kafka-3:9092"
-CLIENT_CONFIG="/etc/kafka/client.properties"
+CLIENT_CONFIG="${KAFKA_CLIENT_PROPERTIES:-/etc/kafka/client.properties}"
 
 echo "Waiting for Kafka brokers to be ready..."
 sleep 10

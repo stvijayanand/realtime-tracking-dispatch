@@ -33,15 +33,14 @@ type Worker struct {
 // and the provided handler map.
 func NewWorker(cfg config.Config, handlers map[string]handler.HandlerFunc, log *logger.Logger) (*Worker, error) {
 	c, err := confluent.NewConsumer(&confluent.ConfigMap{
-		"bootstrap.servers":        cfg.KafkaBootstrapServers,
-		"group.id":                 cfg.KafkaConsumerGroupID,
-		"auto.offset.reset":        "earliest",
-		"enable.auto.commit":       false,
-		"security.protocol":        "SASL_PLAINTEXT",
-		"sasl.mechanisms":          "PLAIN",
-		"sasl.username":            cfg.KafkaSASLUsername,
-		"sasl.password":            cfg.KafkaSASLPassword,
-		"schema.registry.url":      cfg.SchemaRegistryURL,
+		"bootstrap.servers":  cfg.KafkaBootstrapServers,
+		"group.id":           cfg.KafkaConsumerGroupID,
+		"auto.offset.reset":  "earliest",
+		"enable.auto.commit": false,
+		"security.protocol":  "SASL_PLAINTEXT",
+		"sasl.mechanisms":    "PLAIN",
+		"sasl.username":      cfg.KafkaSASLUsername,
+		"sasl.password":      cfg.KafkaSASLPassword,
 	})
 	if err != nil {
 		return nil, err

@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import { useState } from 'react'
 import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet'
 import { DEFAULT_CENTER, DEFAULT_ZOOM } from './config'
 import { requestRide } from './api'

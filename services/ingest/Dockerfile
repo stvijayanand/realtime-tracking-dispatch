@@ -1,25 +1,24 @@
 # =============================================================================
 # Ingest Service — Multi-stage Dockerfile
 # =============================================================================
-# NOTE: The spec mandates CGO_ENABLED=0 with gcr.io/distroless/static-debian12,
-# but confluent-kafka-go v2 requires CGO for its embedded librdkafka C bindings.
-# A pure-static build with CGO_ENABLED=0 is incompatible with confluent-kafka-go.
+# confluent-kafka-go v2 vendors librdkafka compiled against glibc (the .a file
+# is named librdkafka_glibc_linux_amd64.a). Building on Alpine (musl libc)
+# causes undefined references to glibc-specific symbols (__strdup, fopen64,
+# getcontext, etc.) when linking statically.
 #
-# Correct approach used here:
-#   Stage 1 (builder): golang:1.22-alpine with gcc + musl-dev for CGO support.
-#                      CGO_ENABLED=1 with -extldflags="-static" produces a
-#                      fully statically-linked binary via musl libc.
-#   Stage 2 (runtime): gcr.io/distroless/cc-debian12:nonroot — includes libc
-#                      for CGO binaries; runs as nonroot (uid 65532) by default.
+# Solution: use golang:1.25-bookworm (Debian, glibc) as the builder so the
+# linker finds the glibc symbols librdkafka expects. The binary is dynamically
+# linked against glibc and runs in gcr.io/distroless/cc-debian12:nonroot which
+# ships the same glibc runtime.
 #
 # Requirements: 2.11, 10.6, 10.7
 # =============================================================================
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-bookworm AS builder
 
-# Install C compiler and musl-dev for CGO (required by confluent-kafka-go/librdkafka).
-RUN apk add --no-cache gcc musl-dev
+# Install gcc for CGO (required by confluent-kafka-go/librdkafka).
+RUN apt-get update -qq && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
@@ -30,28 +29,28 @@ RUN go mod download
 # Copy source code.
 COPY . .
 
-# Build a statically-linked binary.
+# Build a dynamically-linked binary against glibc.
 # CGO_ENABLED=1  — required for confluent-kafka-go's librdkafka C bindings.
-# -extldflags="-static" — links against musl libc statically so the binary
-#                         is self-contained and runs in a minimal final image.
-# -ldflags="-s -w" — strips debug symbols and DWARF info to reduce binary size.
+# -ldflags="-s -w" — strips debug symbols to reduce binary size.
+# No -extldflags=-static: librdkafka_glibc requires dynamic glibc linking.
 RUN CGO_ENABLED=1 GOOS=linux go build \
-    -ldflags="-s -w -extldflags=-static" \
+    -ldflags="-s -w" \
     -o /app/ingest \
     ./
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-# gcr.io/distroless/cc-debian12:nonroot includes libc for CGO binaries and
-# runs as nonroot (uid 65532) by default — no shell, no package manager,
-# minimal attack surface.
-FROM gcr.io/distroless/cc-debian12:nonroot
+# Use debian-slim instead of distroless so wget is available for health checks.
+# Still runs as nonroot, minimal attack surface.
+FROM debian:bookworm-slim
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends wget ca-certificates && rm -rf /var/lib/apt/lists/* && groupadd -r nonroot && useradd -r -g nonroot nonroot
 
 WORKDIR /app
 
-# Copy only the compiled binary from the build stage.
 COPY --from=builder /app/ingest /app/ingest
 
-# Expose the service port (actual port is set via SERVICE_PORT env var).
+USER nonroot
+
 EXPOSE 8001
 
 ENTRYPOINT ["/app/ingest"]

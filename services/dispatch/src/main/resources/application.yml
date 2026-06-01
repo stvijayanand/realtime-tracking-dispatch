@@ -37,9 +37,17 @@ management:
   endpoint:
     health:
       show-details: always
+  tracing:
+    sampling:
+      probability: 1.0
+  otlp:
+    tracing:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://jaeger:4317}
 
 springdoc:
   api-docs:
     path: /v3/api-docs
   swagger-ui:
     path: /swagger-ui.html
+
+spring.jackson.property-naming-strategy: SNAKE_CASE

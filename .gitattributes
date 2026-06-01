@@ -6,3 +6,7 @@ vendor/** linguist-vendored
 # Ignore auto-generated Go files (e.g., protobuf or mocks)
 *.pb.go linguist-generated
 *_mock.go linguist-generated
+
+# Always use LF for shell scripts — prevents CRLF breaking execution on Linux/Docker
+*.sh text eol=lf
+mvnw text eol=lf

@@ -18,8 +18,8 @@ FROM node:20.12-alpine AS builder
 WORKDIR /app
 
 # Copy package files first for layer caching.
-COPY package.json package-lock.json* ./
-RUN npm ci --prefer-offline
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 # Build-time env var for Dispatch Service URL (Requirement 6.6).
 ARG VITE_DISPATCH_URL=http://localhost:8080

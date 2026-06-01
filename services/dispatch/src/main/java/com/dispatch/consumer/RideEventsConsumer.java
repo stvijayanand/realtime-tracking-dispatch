@@ -1,7 +1,8 @@
 package com.dispatch.consumer;
 
-import com.dispatch.events.DomainEventEnvelope;
 import com.dispatch.service.DispatchService;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,15 +21,16 @@ import java.util.UUID;
  * {@link DispatchService#assignDriver(UUID, String)} which must complete within
  * 2 seconds (Requirement 3.7).
  *
- * <p>W3C {@code traceparent} header is extracted from Kafka message headers and
- * used to create a child OTel span, maintaining the distributed trace across the
- * async boundary (Requirement 12.1).
+ * <p>Messages are plain JSON strings (Phase 1). The value deserialiser is
+ * {@code StringDeserializer} — this consumer parses the JSON manually.
  */
 @Component
 public class RideEventsConsumer {
 
     private static final Logger log = LoggerFactory.getLogger(RideEventsConsumer.class);
     private static final String TRIP_REQUESTED = "TripRequested";
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
 
     private final DispatchService dispatchService;
 
@@ -42,18 +44,24 @@ public class RideEventsConsumer {
         containerFactory = "rideEventsListenerContainerFactory"
     )
     public void onMessage(ConsumerRecord<String, Object> record) {
-        if (!(record.value() instanceof Map)) {
-            log.warn("Received non-map message on ride-events, skipping. offset={}",
-                record.offset());
+        if (record.value() == null) {
+            log.warn("Received null message on ride-events, skipping. offset={}", record.offset());
             return;
         }
 
-        @SuppressWarnings("unchecked")
-        Map<String, Object> raw = (Map<String, Object>) record.value();
+        // Value is a plain JSON String (StringDeserializer, Phase 1).
+        Map<String, Object> raw;
+        try {
+            String json = record.value().toString();
+            raw = MAPPER.readValue(json, MAP_TYPE);
+        } catch (Exception e) {
+            log.warn("Failed to parse JSON on ride-events, skipping. offset={} error={}",
+                record.offset(), e.getMessage());
+            return;
+        }
 
         String eventType = (String) raw.get("event_type");
         if (!TRIP_REQUESTED.equals(eventType)) {
-            // Not a TripRequested event — acknowledge and skip.
             log.debug("Skipping event_type={} on ride-events", eventType);
             return;
         }
@@ -75,7 +83,7 @@ public class RideEventsConsumer {
         }
 
         UUID tripId = UUID.fromString(tripIdStr);
-        log.debug("Processing TripRequested: tripId={} riderId={}", tripId, riderId);
+        log.info("Processing TripRequested: tripId={} riderId={}", tripId, riderId);
 
         dispatchService.assignDriver(tripId, riderId);
     }
