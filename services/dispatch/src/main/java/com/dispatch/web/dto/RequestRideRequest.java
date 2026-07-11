@@ -1,5 +1,6 @@
 package com.dispatch.web.dto;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -12,10 +13,12 @@ import jakarta.validation.constraints.Size;
  * @param pickupLocation WGS-84 coordinate of the pickup point; non-null, validated
  */
 public record RequestRideRequest(
+    @JsonProperty("riderId")
     @NotBlank(message = "rider_id must not be blank")
     @Size(max = 128, message = "rider_id must not exceed 128 characters")
     String riderId,
 
+    @JsonProperty("pickupLocation")
     @NotNull(message = "pickup_location must not be null")
     @Valid
     PickupLocation pickupLocation
