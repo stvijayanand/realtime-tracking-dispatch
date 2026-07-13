@@ -3,9 +3,11 @@ package com.dispatch.service;
 import com.dispatch.domain.Trip;
 import com.dispatch.domain.TripRepository;
 import com.dispatch.domain.TripStatus;
+import com.dispatch.events.AvroEventBuilder;
 import com.dispatch.events.DomainEventEnvelope;
 import com.dispatch.events.EventEnvelopeFactory;
 import com.dispatch.web.dto.PickupLocation;
+import org.apache.avro.generic.GenericRecord;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
@@ -22,8 +24,9 @@ import java.util.UUID;
  * never calls {@code UUID.randomUUID()} directly (except for the tripId, which
  * is a domain concern, not an infrastructure concern).
  *
- * <p>Kafka publish uses {@code KafkaTemplate} configured with {@code acks=all}
- * and {@code enable.idempotence=true} (Requirement 3.10).
+ * <p>Kafka publish uses {@code KafkaTemplate} configured with Avro serialization
+ * via Schema Registry, {@code acks=all}, and {@code enable.idempotence=true}
+ * (Requirement 3.10).
  */
 @Service
 public class DispatchService {
@@ -51,12 +54,9 @@ public class DispatchService {
      *   <li>Generates a new {@code tripId} (UUID v4).</li>
      *   <li>Persists {@code Trip(status=REQUESTED)} to PostgreSQL via PgBouncer.</li>
      *   <li>Builds a {@code TripRequested} envelope via {@link EventEnvelopeFactory}.</li>
-     *   <li>Publishes the envelope to the {@code ride-events} Kafka topic.</li>
+     *   <li>Converts to Avro {@link GenericRecord} and publishes to {@code ride-events}.</li>
      *   <li>Returns the {@code tripId} in the HTTP 202 response.</li>
      * </ol>
-     *
-     * <p>The Trip record is written before the HTTP response is returned, so the
-     * {@code trip_id} is always backed by a DB record (Requirement 3.4).
      *
      * @param riderId identifier of the requesting rider
      * @param pickup  WGS-84 coordinate of the pickup location
@@ -75,7 +75,8 @@ public class DispatchService {
         DomainEventEnvelope envelope = EventEnvelopeFactory.buildTripRequested(
             tripId, riderId, pickup.latitude(), pickup.longitude(), requestedAt);
 
-        kafkaTemplate.send(rideEventsTopic, tripId.toString(), envelope);
+        GenericRecord avroRecord = AvroEventBuilder.buildTripRequestedRecord(envelope);
+        kafkaTemplate.send(rideEventsTopic, tripId.toString(), avroRecord);
 
         return tripId;
     }
@@ -88,11 +89,8 @@ public class DispatchService {
      *   <li>Asserts the state transition {@code REQUESTED → ASSIGNED} is valid.</li>
      *   <li>Selects a driver via {@link DriverSelectionStrategy}.</li>
      *   <li>Updates Trip ({@code status=ASSIGNED}, {@code driverId}, {@code assignedAt}).</li>
-     *   <li>Builds a {@code TripAssigned} envelope via {@link EventEnvelopeFactory}.</li>
-     *   <li>Publishes the envelope to the {@code ride-events} Kafka topic.</li>
+     *   <li>Builds a {@code TripAssigned} envelope and publishes Avro record to Kafka.</li>
      * </ol>
-     *
-     * <p>Must complete within 2 seconds of consumption (Requirement 3.7).
      *
      * @param tripId  UUID of the Trip aggregate to assign
      * @param riderId identifier of the rider (carried forward from TripRequested)
@@ -117,6 +115,7 @@ public class DispatchService {
         DomainEventEnvelope envelope = EventEnvelopeFactory.buildTripAssigned(
             tripId, driverId, riderId, assignedAt);
 
-        kafkaTemplate.send(rideEventsTopic, tripId.toString(), envelope);
+        GenericRecord avroRecord = AvroEventBuilder.buildTripAssignedRecord(envelope);
+        kafkaTemplate.send(rideEventsTopic, tripId.toString(), avroRecord);
     }
 }

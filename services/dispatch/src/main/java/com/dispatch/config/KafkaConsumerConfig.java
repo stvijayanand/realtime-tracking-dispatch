@@ -1,5 +1,6 @@
 package com.dispatch.config;
 
+import io.confluent.kafka.serializers.KafkaAvroDeserializer;
 import io.confluent.kafka.serializers.KafkaAvroDeserializerConfig;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.serialization.StringDeserializer;
@@ -22,10 +23,10 @@ import java.util.Map;
  *
  * <p>Two consumer factories:
  * <ul>
- *   <li>{@code rideEventsConsumerFactory} — {@code ride-events} topic, Avro deserialiser,
- *       group {@code dispatch-consumer-group}</li>
- *   <li>{@code locationConsumerFactory} — {@code gps-pings} topic, plain String deserialiser
- *       (Phase 1 stub — Ingest publishes JSON, not Avro), group {@code dispatch-location-group}</li>
+ *   <li>{@code rideEventsConsumerFactory} — {@code ride-events} topic, Avro deserialiser
+ *       via Schema Registry, group {@code dispatch-consumer-group}</li>
+ *   <li>{@code locationConsumerFactory} — {@code gps-pings} topic, Avro deserialiser
+ *       via Schema Registry, group {@code dispatch-location-group}</li>
  * </ul>
  *
  * <p>Both factories wrap the value deserialiser in {@link ErrorHandlingDeserializer} so that
@@ -44,6 +45,9 @@ public class KafkaConsumerConfig {
     @Value("${KAFKA_SASL_PASSWORD}")
     private String saslPassword;
 
+    @Value("${SCHEMA_REGISTRY_URL:http://schema-registry:8081}")
+    private String schemaRegistryUrl;
+
     // ── SASL/PLAIN base props ──────────────────────────────────────────────────
 
     private Map<String, Object> saslProps() {
@@ -59,12 +63,12 @@ public class KafkaConsumerConfig {
         return props;
     }
 
-    // ── ride-events consumer: Avro deserialiser ────────────────────────────────
+    // ── ride-events consumer: Avro deserialiser via Schema Registry ────────────
 
     /**
      * Consumer factory for the {@code ride-events} topic.
-     * Uses plain String deserialisation — the Dispatch Service publishes JSON
-     * (not Avro) in Phase 1. The RideEventsConsumer parses the JSON manually.
+     * Uses Avro deserialization via Schema Registry. The Dispatch Service
+     * publishes and consumes Avro-encoded Domain Events.
      * Wrapped in {@link ErrorHandlingDeserializer} for resilience.
      */
     @Bean("rideEventsConsumerFactory")
@@ -73,26 +77,23 @@ public class KafkaConsumerConfig {
         props.put(ConsumerConfig.GROUP_ID_CONFIG, "dispatch-consumer-group");
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
 
-        // Plain String deserialiser — Dispatch publishes JSON, not Avro, in Phase 1.
+        // Avro deserialiser via Schema Registry, wrapped in ErrorHandlingDeserializer.
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ErrorHandlingDeserializer.class);
-        props.put(ErrorHandlingDeserializer.VALUE_DESERIALIZER_CLASS, StringDeserializer.class.getName());
+        props.put(ErrorHandlingDeserializer.VALUE_DESERIALIZER_CLASS, KafkaAvroDeserializer.class.getName());
+        props.put(KafkaAvroDeserializerConfig.SCHEMA_REGISTRY_URL_CONFIG, schemaRegistryUrl);
+        props.put(KafkaAvroDeserializerConfig.SPECIFIC_AVRO_READER_CONFIG, false);
 
         return new DefaultKafkaConsumerFactory<>(props);
     }
 
-    // ── gps-pings consumer: plain String deserialiser (Phase 1 stub) ──────────
+    // ── gps-pings consumer: Avro deserialiser via Schema Registry ──────────────
 
     /**
      * Consumer factory for the {@code gps-pings} topic.
      *
-     * <p>Phase 1: the Ingest Service publishes plain JSON (not Avro). The Dispatch
-     * service only stubs this consumer — it logs receipt at DEBUG level and does NOT
-     * write to Redis (that is Phase 2). Using {@link StringDeserializer} avoids the
-     * "Unknown magic byte" error that occurs when the Avro deserialiser encounters
-     * a non-Avro payload.
-     *
-     * <p>Phase 2: switch to {@link KafkaAvroDeserializer} once the Ingest Service
+     * <p>Uses Avro deserialization via Schema Registry. The Ingest Service
      * publishes Avro-encoded {@code LocationPingReceived} events.
+     * Wrapped in {@link ErrorHandlingDeserializer} for resilience.
      */
     @Bean("locationConsumerFactory")
     public ConsumerFactory<String, Object> locationConsumerFactory() {
@@ -100,10 +101,11 @@ public class KafkaConsumerConfig {
         props.put(ConsumerConfig.GROUP_ID_CONFIG, "dispatch-location-group");
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
 
-        // Plain String deserialiser — Phase 1 Ingest publishes JSON, not Avro.
-        // Wrapped in ErrorHandlingDeserializer for resilience.
+        // Avro deserialiser via Schema Registry, wrapped in ErrorHandlingDeserializer.
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ErrorHandlingDeserializer.class);
-        props.put(ErrorHandlingDeserializer.VALUE_DESERIALIZER_CLASS, StringDeserializer.class.getName());
+        props.put(ErrorHandlingDeserializer.VALUE_DESERIALIZER_CLASS, KafkaAvroDeserializer.class.getName());
+        props.put(KafkaAvroDeserializerConfig.SCHEMA_REGISTRY_URL_CONFIG, schemaRegistryUrl);
+        props.put(KafkaAvroDeserializerConfig.SPECIFIC_AVRO_READER_CONFIG, false);
 
         return new DefaultKafkaConsumerFactory<>(props);
     }

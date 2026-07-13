@@ -1,15 +1,13 @@
 package com.dispatch.consumer;
 
 import com.dispatch.service.DispatchService;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
-import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -21,16 +19,14 @@ import java.util.UUID;
  * {@link DispatchService#assignDriver(UUID, String)} which must complete within
  * 2 seconds (Requirement 3.7).
  *
- * <p>Messages are plain JSON strings (Phase 1). The value deserialiser is
- * {@code StringDeserializer} — this consumer parses the JSON manually.
+ * <p>Messages are Avro-encoded {@link GenericRecord} instances deserialized by
+ * the {@code KafkaAvroDeserializer} via Schema Registry.
  */
 @Component
 public class RideEventsConsumer {
 
     private static final Logger log = LoggerFactory.getLogger(RideEventsConsumer.class);
     private static final String TRIP_REQUESTED = "TripRequested";
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
 
     private final DispatchService dispatchService;
 
@@ -49,32 +45,33 @@ public class RideEventsConsumer {
             return;
         }
 
-        // Value is a plain JSON String (StringDeserializer, Phase 1).
-        Map<String, Object> raw;
+        // Value is an Avro GenericRecord deserialized by KafkaAvroDeserializer.
+        GenericRecord envelope;
         try {
-            String json = record.value().toString();
-            raw = MAPPER.readValue(json, MAP_TYPE);
-        } catch (Exception e) {
-            log.warn("Failed to parse JSON on ride-events, skipping. offset={} error={}",
+            envelope = (GenericRecord) record.value();
+        } catch (ClassCastException e) {
+            log.warn("Failed to cast value to GenericRecord on ride-events, skipping. offset={} error={}",
                 record.offset(), e.getMessage());
             return;
         }
 
-        String eventType = (String) raw.get("event_type");
+        String eventType = envelope.get("event_type") != null
+            ? envelope.get("event_type").toString() : null;
         if (!TRIP_REQUESTED.equals(eventType)) {
             log.debug("Skipping event_type={} on ride-events", eventType);
             return;
         }
 
-        @SuppressWarnings("unchecked")
-        Map<String, Object> payload = (Map<String, Object>) raw.get("payload");
+        GenericRecord payload = (GenericRecord) envelope.get("payload");
         if (payload == null) {
             log.warn("TripRequested event missing payload, skipping. offset={}", record.offset());
             return;
         }
 
-        String tripIdStr = (String) payload.get("trip_id");
-        String riderId   = (String) payload.get("rider_id");
+        String tripIdStr = payload.get("trip_id") != null
+            ? payload.get("trip_id").toString() : null;
+        String riderId = payload.get("rider_id") != null
+            ? payload.get("rider_id").toString() : null;
 
         if (tripIdStr == null || riderId == null) {
             log.warn("TripRequested payload missing trip_id or rider_id, skipping. offset={}",

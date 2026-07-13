@@ -1,5 +1,7 @@
 package com.dispatch.config;
 
+import io.confluent.kafka.serializers.KafkaAvroSerializer;
+import io.confluent.kafka.serializers.KafkaAvroSerializerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.springframework.beans.factory.annotation.Value;
@@ -8,7 +10,6 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.core.ProducerFactory;
-import org.springframework.kafka.support.serializer.JsonSerializer;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -19,9 +20,9 @@ import java.util.Map;
  * <p>Configures the {@link KafkaTemplate} with SASL/PLAIN credentials,
  * {@code acks=all}, and {@code enable.idempotence=true} (Requirement 3.10).
  *
- * <p>Uses {@link JsonSerializer} for values so {@link com.dispatch.events.DomainEventEnvelope}
- * records are serialised as JSON — compatible with the Go consumers in Phase 1.
- * Phase 2 will switch to Avro via Schema Registry.
+ * <p>Uses {@link KafkaAvroSerializer} for values — Domain Events are serialised
+ * as Avro via Schema Registry. The schema is auto-registered on first publish
+ * using the TopicNameStrategy (subject = {@code <topic>-value}).
  */
 @Configuration
 public class KafkaProducerConfig {
@@ -35,14 +36,20 @@ public class KafkaProducerConfig {
     @Value("${KAFKA_SASL_PASSWORD}")
     private String saslPassword;
 
+    @Value("${SCHEMA_REGISTRY_URL:http://schema-registry:8081}")
+    private String schemaRegistryUrl;
+
     @Bean
     public ProducerFactory<String, Object> producerFactory() {
         Map<String, Object> props = new HashMap<>();
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class);
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        // Schema Registry configuration
+        props.put(KafkaAvroSerializerConfig.SCHEMA_REGISTRY_URL_CONFIG, schemaRegistryUrl);
+        props.put(KafkaAvroSerializerConfig.AUTO_REGISTER_SCHEMAS, true);
         // SASL/PLAIN authentication
         props.put("security.protocol", "SASL_PLAINTEXT");
         props.put("sasl.mechanism", "PLAIN");

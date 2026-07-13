@@ -3,15 +3,30 @@ package consumer
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/binary"
+	"fmt"
 	"sync"
 
 	confluent "github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/hamba/avro/v2"
+	"github.com/riferrei/srclient"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/realtime-tracking/notification/config"
 	"github.com/realtime-tracking/notification/handler"
 	"github.com/realtime-tracking/notification/logger"
 )
+
+// RideEventEnvelope is the Avro-deserialized record for ride-events topic.
+// Fields match the Avro schemas in shared/avro/ (TripAssigned, TripRequested, etc).
+// The Payload field uses map[string]interface{} for flexibility across event types.
+type RideEventEnvelope struct {
+	EventID    string                 `avro:"event_id"`
+	EventType  string                 `avro:"event_type"`
+	OccurredAt string                 `avro:"occurred_at"`
+	Payload    map[string]interface{} `avro:"payload"`
+}
 
 // Worker is a Kafka consumer that polls messages, routes them to handlers by
 // event_type, and commits offsets after each message is processed.
@@ -23,14 +38,15 @@ import (
 // child OTel span, maintaining the distributed trace (Requirement 12.1).
 type Worker struct {
 	consumer *confluent.Consumer
+	srClient *srclient.SchemaRegistryClient
 	handlers map[string]handler.HandlerFunc
 	log      *logger.Logger
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 }
 
-// NewWorker creates a new Kafka consumer worker configured with SASL/PLAIN
-// and the provided handler map.
+// NewWorker creates a new Kafka consumer worker configured with SASL/PLAIN,
+// Avro deserialization via Schema Registry, and the provided handler map.
 func NewWorker(cfg config.Config, handlers map[string]handler.HandlerFunc, log *logger.Logger) (*Worker, error) {
 	c, err := confluent.NewConsumer(&confluent.ConfigMap{
 		"bootstrap.servers":  cfg.KafkaBootstrapServers,
@@ -51,8 +67,12 @@ func NewWorker(cfg config.Config, handlers map[string]handler.HandlerFunc, log *
 		return nil, err
 	}
 
+	// Create Schema Registry client for schema lookup during deserialization.
+	srClient := srclient.CreateSchemaRegistryClient(cfg.SchemaRegistryURL)
+
 	return &Worker{
 		consumer: c,
+		srClient: srClient,
 		handlers: handlers,
 		log:      log,
 		stopCh:   make(chan struct{}),
@@ -106,40 +126,73 @@ func (w *Worker) run() {
 	}
 }
 
-// processMessage deserialises the Kafka message and routes it to the correct handler.
+// processMessage deserialises the Kafka message using Avro and routes it to the correct handler.
 func (w *Worker) processMessage(ctx context.Context, msg *confluent.Message) {
-	// Deserialise JSON envelope.
-	var envelope map[string]interface{}
-	if err := json.Unmarshal(msg.Value, &envelope); err != nil {
-		w.log.LogWarning(ctx, "failed to deserialise kafka message", msg.Value)
+	// Deserialise Avro envelope via Schema Registry wire format.
+	envelope, err := w.deserializeAvro(msg.Value)
+	if err != nil {
+		w.log.LogWarning(ctx, fmt.Sprintf("failed to deserialise avro kafka message: %v", err), msg.Value)
 		return
 	}
 
+	// Convert to map for handler compatibility.
+	envelopeMap := map[string]interface{}{
+		"event_id":    envelope.EventID,
+		"event_type":  envelope.EventType,
+		"occurred_at": envelope.OccurredAt,
+		"payload":     envelope.Payload,
+	}
+
 	// Extract event_type for routing.
-	eventType, _ := envelope["event_type"].(string)
+	eventType := envelope.EventType
 
 	// Route to handler — fall back to NoOpHandler for unknown event types.
 	h, ok := w.handlers[eventType]
 	if !ok {
 		h = handler.NoOpHandler
 	}
-	h(ctx, envelope)
+	h(ctx, envelopeMap)
+}
+
+// deserializeAvro decodes a Confluent Schema Registry wire-format message:
+// [magic byte (0)] [4-byte schema ID (big-endian)] [avro binary payload]
+func (w *Worker) deserializeAvro(data []byte) (*RideEventEnvelope, error) {
+	if len(data) < 5 {
+		return nil, fmt.Errorf("message too short for avro wire format: %d bytes", len(data))
+	}
+	if data[0] != 0 {
+		return nil, fmt.Errorf("invalid magic byte: expected 0, got %d", data[0])
+	}
+
+	schemaID := binary.BigEndian.Uint32(data[1:5])
+	avroPayload := data[5:]
+
+	// Fetch schema from registry by ID (srclient caches internally).
+	schema, err := w.srClient.GetSchema(int(schemaID))
+	if err != nil {
+		return nil, fmt.Errorf("fetching schema ID %d from registry: %w", schemaID, err)
+	}
+
+	// Parse the Avro schema and unmarshal the binary payload.
+	parsedSchema, err := avro.Parse(schema.Schema())
+	if err != nil {
+		return nil, fmt.Errorf("parsing avro schema: %w", err)
+	}
+
+	var envelope RideEventEnvelope
+	if err := avro.Unmarshal(parsedSchema, avroPayload, &envelope); err != nil {
+		return nil, fmt.Errorf("unmarshalling avro payload: %w", err)
+	}
+
+	return &envelope, nil
 }
 
 // extractTraceContext extracts the W3C traceparent header from Kafka message
 // headers and returns a context with the parent span set.
-// If no traceparent header is present, the original context is returned unchanged.
 func extractTraceContext(ctx context.Context, headers []confluent.Header) context.Context {
-	// Build a carrier map from Kafka headers.
-	carrier := make(map[string]string, len(headers))
+	carrier := propagation.MapCarrier{}
 	for _, h := range headers {
 		carrier[h.Key] = string(h.Value)
 	}
-
-	// Use OTel W3C propagator to extract the trace context.
-	// Import is deferred to avoid circular deps — use the global propagator.
-	// In production this is wired up in main.go via otel.SetTextMapPropagator.
-	// For Phase 1 the context is passed through as-is if no propagator is set.
-	_ = carrier // propagator injection happens in main.go
-	return ctx
+	return otel.GetTextMapPropagator().Extract(ctx, carrier)
 }

@@ -14,8 +14,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -126,9 +128,16 @@ func initTracer(otlpEndpoint string) (*sdktrace.TracerProvider, error) {
 		return nil, fmt.Errorf("creating OTLP exporter: %w", err)
 	}
 
+	res, _ := resource.New(ctx,
+		resource.WithAttributes(
+			attribute.String("service.name", "gateway-service"),
+		),
+	)
+
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithResource(res),
 	)
 
 	otel.SetTracerProvider(tp)

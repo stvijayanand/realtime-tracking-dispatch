@@ -3,11 +3,15 @@ package consumer
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync"
 
 	confluent "github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/hamba/avro/v2"
+	"github.com/riferrei/srclient"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 
@@ -24,19 +28,30 @@ var filteredEventTypes = map[string]bool{
 	"TripCompleted": true,
 }
 
+// RideEventEnvelope is the Avro-deserialized record for ride-events topic.
+// Fields match the Avro schemas in shared/avro/ (TripAssigned, TripCancelled, etc).
+type RideEventEnvelope struct {
+	EventID    string                 `avro:"event_id"`
+	EventType  string                 `avro:"event_type"`
+	OccurredAt string                 `avro:"occurred_at"`
+	Payload    map[string]interface{} `avro:"payload"`
+}
+
 // Worker is a Kafka consumer that polls ride-events, extracts the rider_id,
 // and pushes the event payload as a JSON frame over the rider's WebSocket.
 //
-// On Avro/JSON deserialisation failure: logs warning, commits offset, continues.
+// On Avro deserialisation failure: logs warning, commits offset, continues.
 // W3C traceparent header is extracted from Kafka headers to create a child OTel span.
 type Worker struct {
 	consumer *confluent.Consumer
+	srClient *srclient.SchemaRegistryClient
 	registry *session.Registry
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 }
 
-// NewWorker creates a new Kafka consumer worker for the gateway-consumer-group.
+// NewWorker creates a new Kafka consumer worker for the gateway-consumer-group
+// with Avro deserialization via Schema Registry.
 func NewWorker(cfg config.Config, registry *session.Registry) (*Worker, error) {
 	c, err := confluent.NewConsumer(&confluent.ConfigMap{
 		"bootstrap.servers":  cfg.KafkaBootstrapServers,
@@ -57,8 +72,12 @@ func NewWorker(cfg config.Config, registry *session.Registry) (*Worker, error) {
 		return nil, err
 	}
 
+	// Create Schema Registry client for schema lookup during deserialization.
+	srClient := srclient.CreateSchemaRegistryClient(cfg.SchemaRegistryURL)
+
 	return &Worker{
 		consumer: c,
+		srClient: srClient,
 		registry: registry,
 		stopCh:   make(chan struct{}),
 	}, nil
@@ -107,21 +126,22 @@ func (w *Worker) run() {
 }
 
 func (w *Worker) processMessage(ctx context.Context, msg *confluent.Message) {
-	var envelope map[string]interface{}
-	if err := json.Unmarshal(msg.Value, &envelope); err != nil {
-		slog.Warn("failed to deserialise kafka message",
+	// Deserialise Avro envelope via Schema Registry wire format.
+	envelope, err := w.deserializeAvro(msg.Value)
+	if err != nil {
+		slog.Warn("failed to deserialise avro kafka message",
 			"offset", msg.TopicPartition.Offset,
 			"error", err)
 		return
 	}
 
-	eventType, _ := envelope["event_type"].(string)
+	eventType := envelope.EventType
 	if !filteredEventTypes[eventType] {
 		return // not a relevant event type — acknowledge and skip
 	}
 
 	// Extract rider_id from payload.
-	payload, _ := envelope["payload"].(map[string]interface{})
+	payload := envelope.Payload
 	if payload == nil {
 		slog.Warn("event missing payload", "event_type", eventType)
 		return
@@ -132,8 +152,14 @@ func (w *Worker) processMessage(ctx context.Context, msg *confluent.Message) {
 		return
 	}
 
-	// Serialise the full envelope as the WebSocket frame payload.
-	frame, err := json.Marshal(envelope)
+	// Build a JSON frame for WebSocket push (riders expect JSON, not Avro binary).
+	wsPayload := map[string]interface{}{
+		"event_id":    envelope.EventID,
+		"event_type":  envelope.EventType,
+		"occurred_at": envelope.OccurredAt,
+		"payload":     envelope.Payload,
+	}
+	frame, err := json.Marshal(wsPayload)
 	if err != nil {
 		slog.Warn("failed to serialise event for websocket", "error", err)
 		return
@@ -145,6 +171,39 @@ func (w *Worker) processMessage(ctx context.Context, msg *confluent.Message) {
 			"rider_id", riderID,
 			"event_type", eventType)
 	}
+}
+
+// deserializeAvro decodes a Confluent Schema Registry wire-format message:
+// [magic byte (0)] [4-byte schema ID (big-endian)] [avro binary payload]
+func (w *Worker) deserializeAvro(data []byte) (*RideEventEnvelope, error) {
+	if len(data) < 5 {
+		return nil, fmt.Errorf("message too short for avro wire format: %d bytes", len(data))
+	}
+	if data[0] != 0 {
+		return nil, fmt.Errorf("invalid magic byte: expected 0, got %d", data[0])
+	}
+
+	schemaID := binary.BigEndian.Uint32(data[1:5])
+	avroPayload := data[5:]
+
+	// Fetch schema from registry by ID (srclient caches internally).
+	schema, err := w.srClient.GetSchema(int(schemaID))
+	if err != nil {
+		return nil, fmt.Errorf("fetching schema ID %d from registry: %w", schemaID, err)
+	}
+
+	// Parse the Avro schema and unmarshal the binary payload.
+	parsedSchema, err := avro.Parse(schema.Schema())
+	if err != nil {
+		return nil, fmt.Errorf("parsing avro schema: %w", err)
+	}
+
+	var envelope RideEventEnvelope
+	if err := avro.Unmarshal(parsedSchema, avroPayload, &envelope); err != nil {
+		return nil, fmt.Errorf("unmarshalling avro payload: %w", err)
+	}
+
+	return &envelope, nil
 }
 
 // extractTraceContext extracts the W3C traceparent header from Kafka message
