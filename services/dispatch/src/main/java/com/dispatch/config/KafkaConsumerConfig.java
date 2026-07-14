@@ -82,6 +82,8 @@ public class KafkaConsumerConfig {
         props.put(ErrorHandlingDeserializer.VALUE_DESERIALIZER_CLASS, KafkaAvroDeserializer.class.getName());
         props.put(KafkaAvroDeserializerConfig.SCHEMA_REGISTRY_URL_CONFIG, schemaRegistryUrl);
         props.put(KafkaAvroDeserializerConfig.SPECIFIC_AVRO_READER_CONFIG, false);
+        props.put("value.subject.name.strategy",
+            "io.confluent.kafka.serializers.subject.RecordNameStrategy");
 
         return new DefaultKafkaConsumerFactory<>(props);
     }
@@ -106,6 +108,8 @@ public class KafkaConsumerConfig {
         props.put(ErrorHandlingDeserializer.VALUE_DESERIALIZER_CLASS, KafkaAvroDeserializer.class.getName());
         props.put(KafkaAvroDeserializerConfig.SCHEMA_REGISTRY_URL_CONFIG, schemaRegistryUrl);
         props.put(KafkaAvroDeserializerConfig.SPECIFIC_AVRO_READER_CONFIG, false);
+        props.put("value.subject.name.strategy",
+            "io.confluent.kafka.serializers.subject.RecordNameStrategy");
 
         return new DefaultKafkaConsumerFactory<>(props);
     }

@@ -50,6 +50,8 @@ public class KafkaProducerConfig {
         // Schema Registry configuration
         props.put(KafkaAvroSerializerConfig.SCHEMA_REGISTRY_URL_CONFIG, schemaRegistryUrl);
         props.put(KafkaAvroSerializerConfig.AUTO_REGISTER_SCHEMAS, true);
+        props.put(KafkaAvroSerializerConfig.VALUE_SUBJECT_NAME_STRATEGY,
+            "io.confluent.kafka.serializers.subject.RecordNameStrategy");
         // SASL/PLAIN authentication
         props.put("security.protocol", "SASL_PLAINTEXT");
         props.put("sasl.mechanism", "PLAIN");

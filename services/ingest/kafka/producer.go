@@ -102,14 +102,16 @@ func NewProducer(cfg config.Config) (*Producer, error) {
 }
 
 // getOrRegisterSchema lazily registers the Avro schema with Schema Registry
-// on first call (TopicNameStrategy: subject = <topic>-value). Subsequent calls
-// return the cached schema. This is thread-safe via srclient's internal caching.
+// on first call (RecordNameStrategy: subject = fully-qualified record name,
+// e.g. "com.dispatch.events.LocationPingReceived"). Subsequent calls return
+// the cached schema. This is thread-safe via srclient's internal caching.
 func (p *Producer) getOrRegisterSchema() (*srclient.Schema, error) {
 	if p.schema != nil {
 		return p.schema, nil
 	}
 
-	subject := p.topic + "-value"
+	// RecordNameStrategy: subject = namespace.name from the Avro schema.
+	subject := "com.dispatch.events.LocationPingReceived"
 	schema, err := p.srClient.CreateSchema(subject, avroSchema, srclient.Avro)
 	if err != nil {
 		return nil, fmt.Errorf("registering schema with registry: %w", err)
