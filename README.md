@@ -3,8 +3,8 @@
   <summary><b>▶️ Click here to watch the YouTube Video Summary</b></summary>
   <br>
   
-  <a href="https://youtu.be/2mgv0U3-Vzg">
-    <img src="https://youtu.be/2mgv0U3-Vzg" alt="Watch the video summary" width="100%">
+  <a href="https://youtu.be/gJgjNrIJB3Q">
+    <img src="https://youtu.be/gJgjNrIJB3Q" alt="Watch the video summary" width="100%">
   </a>
 </details>
 
