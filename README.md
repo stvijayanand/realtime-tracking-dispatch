@@ -4,7 +4,7 @@
   <br>
   
   <a href="https://youtu.be/gJgjNrIJB3Q">
-    <img src="[https://youtu.be/gJgjNrIJB3Q](https://img.youtube.com/vi/gJgjNrIJB3Q/hqdefault.jpg)" alt="Watch the video summary" width="100%">
+    <img src="https://img.youtube.com/vi/gJgjNrIJB3Q/hqdefault.jpg" alt="Watch the video summary" width="100%">
   </a>
 </details>
 
